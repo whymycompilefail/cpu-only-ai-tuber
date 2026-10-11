@@ -49,7 +49,7 @@ fork 出去的副本。换句话说：本地改错随时能改，一旦发出去
 | `.gitignore` | 必须**早于 `git init`** 存在。已排 `live.local.sh`、`*.log`、`Open-LLM-VTuber/logs/`、`ctest/shots/`、各模型目录、Live2D 模型、`dist/` |
 | `ctest/live.local.sh` + `.example.sh` | 房间号有唯一受控的家；前者永不 commit，后者带占位符可发 |
 | `ctest/scrub_scan.py` | 五项正则扫描：房间号 / Windows 用户名 / 绝对路径 / SESSDATA / 邮箱。有命中就 exit 1 |
-| `ctest/make_release.py` | 白名单打包到 `dist/`，顺带重写已知泄漏。自身不发布（产出是 `dist`，不是它自己） |
+| `ctest/make_release.py` | 白名单把三个子树重建成 `dist/`，并同时尊重 git 的判定。自身不发布（产出是 `dist`，不是它自己） |
 | `ctest/fake_page.py` | 无头替身页面：不打开浏览器就能验证 G3/G4 闭环并确认 TTS 出声（字节数可读） |
 | `ASSETS.md` | 大体积资产的获取方式与协议依据，仓库不含一个字节的权重 |
 
@@ -263,9 +263,34 @@ echo "exit=$?"     # 必须是 0，五项全 clean
 **B. `dist/MANIFEST.txt`**：每次发布的第一件事是 `diff` 上一版（`100` 个文件的路径 + 内容摘要）。
 发布变成可审查的差异，而不是一次黑箱覆盖。
 
-**C. 漏包报告**：`make_release.py` 会打印**没能进包的源码文件**，把白名单的沉默变成一句提示。
-这条一上线就抓到一个真问题：`ASSETS.md` 里引用的 `ctest/benchmark_model_choice.md`
-根本不在包里——文档指着一个不存在的文件。
+**C. 双向漂移报告**：`make_release.py` 会把 `dist` 与 `git ls-files` **两边对照**着打出来——
+既有「git 发但 dist 没有」（新工作忘了加白名单），也有「dist 有但 git 不跟踪」
+（往往是本地产物偷偷外流）。范围是整个仓库的被跟踪文件，不再只盯 `ctest/`、`specs/` 两处，
+否则新起一个顶层目录能整个溜出去。
+
+这条一上线就抓到三个真问题：`models` 这条排除字符串伤了 `llama.cpp/src/models/`（那是**源码**，
+一次丢 200 个文件）；没人读的 `Open-LLM-VTuber/conf.yaml`（4 处本机路径）和 40 张背景图
+被打包脚本自己捞进 `dist`；三个 `ppl_*.txt` 评测语料没有任何脚本引用却一直躺在包里。
+
+### 🔴 `.gitignore` 会被**更深层**的文件无声覆盖（已踩）
+
+优先级按**目录深度**，不按书写顺序。上游 `Open-LLM-VTuber/.gitignore` 里有两条取反：
+
+```
+/live2d-models/*
+!/live2d-models/mao_pro      ← 比根 .gitignore 深一层，所以赢
+!/live2d-models/shizuku
+```
+
+结果：根 `.gitignore` 明写着排除，`git add -A` 还是把 37 个 Live2D 模型文件收走并推送了出去，
+全程没有任何报错。
+
+两个必须记住的查错要点：
+
+1. `git check-ignore` **默认跳过已跟踪文件** ⇒ 对着出问题的文件问，它回答「没被忽略」。
+   必须加 `--no-index` 才看得到真相。
+2. 想压住深层取反，只能从**更深的目录**回应 ⇒ 见 `Open-LLM-VTuber/live2d-models/.gitignore`
+   （带完整注释）。这个文件还得 `git add -f`：它要去对抗的那条通配规则，连它自己一起挡。
 
 ### 每次迭代的流程
 
