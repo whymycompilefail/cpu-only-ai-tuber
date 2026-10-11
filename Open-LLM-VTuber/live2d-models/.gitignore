@@ -1,0 +1,33 @@
+# Added by us. Not part of upstream Open-LLM-VTuber.
+#
+# Why this file has to live here (depth matters)
+# ----------------------------------------------
+# The root .gitignore excludes these two models:
+#
+#     Open-LLM-VTuber/live2d-models/mao_pro/
+#     Open-LLM-VTuber/live2d-models/shizuku/
+#
+# but the rules had no effect, because the vendored .gitignore one level up
+# re-includes them:
+#
+#     /live2d-models/*
+#     !/live2d-models/mao_pro      <-- negation
+#     !/live2d-models/shizuku      <-- negation
+#
+# A .gitignore deeper in the tree takes precedence over one further up, so the
+# negation wins no matter what the root file says. The result was silent: no
+# error, no warning, 37 model files tracked and pushed. `git check-ignore`
+# hides it too -- by default it skips already-tracked files, so you have to ask
+# with `--no-index` to see the truth.
+#
+# The only way to win is to answer from a deeper directory than the one holding
+# the negation, which is exactly what this file does. Adding it is preferable
+# to editing upstream's file: this is additive, reviewable, and survives an
+# upstream sync.
+#
+# License note: these two are Live2D's official free sample models, distributed
+# upstream under the "Free Material License Agreement". We still keep them out
+# because the release boundary is "our own source only" -- see ASSETS.md for
+# how to obtain a character model.
+mao_pro/
+shizuku/

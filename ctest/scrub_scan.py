@@ -67,7 +67,11 @@ PATTERNS = [
     # the value, every single time.
     ("sessdata", re.compile(r"(?i)(?:sessdata|bili_jct)\s*[=:]\s*[\"']?"
                             r"[A-Za-z0-9%_\-]{16,}")),
-    ("email", re.compile(r"[\w.+-]+@[\w-]+\.[\w.]{2,}")),
+    # Alpha-only TLD, because the old `[\w.]{2,}` ending matched version pins in
+    # vendored bundles (`https://cdn.jsdelivr.net/npm/onnxruntime-web@1.14.0/`)
+    # and reported them as somebody's inbox. A scanner that cries wolf on every
+    # run is the one people learn to silence with --no-verify.
+    ("email", re.compile(r"[\w.+-]+@[\w-]+\.[A-Za-z]{2,}")),
 ]
 
 # Directories that are pure machinery or someone else's checkout.
