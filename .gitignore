@@ -1,0 +1,176 @@
+# Machine-local values that must never reach the published tree.
+# This file has to exist BEFORE `git init` + the first `git add`, not after:
+# gitignore cannot untrack something already committed, and rewriting published
+# history does not touch forks that already cloned it.
+ctest/live.local.sh
+
+# Your bilibili cookies (output of ctest/cookie_export.js). May contain
+# SESSDATA, which is full account authority. Never commit, never share.
+ctest/bili_cookie.txt
+
+# Session notes and accumulated agent memory.
+.workbuddy/
+
+# Per-turn transcripts written by the backend. Same privacy class as the logs:
+# once the danmaku bridge is live this holds word-for-word what viewers said.
+# Found by reading (not by guessing) -- it was missing for three days.
+Open-LLM-VTuber/chat_history/
+
+# Runtime output: session logs, screenshots, the bridge's per-danmaku trace.
+# The bridge log records <username> <message> for every viewer, which is their
+# privacy rather than yours -- leave it out regardless of anything else.
+*.log
+Open-LLM-VTuber/logs/
+ctest/shots/
+ctest/data/
+
+# Scratch output.
+ctest/bn/
+ctest/bt/
+ctest/bin-base/
+ctest/bin-gqa/
+ctest/bin-tq/
+dist/
+
+# Test audio produced by the TTS probes.
+ctest/*.wav
+ctest/*.mp3
+
+# Python.
+__pycache__/
+*.pyc
+.venv/
+
+# Third-party weights and engines: not ours to redistribute.
+models/*.gguf
+models/*.bin
+models/*.safetensors
+# NOTE: `llama.cpp/` used to be excluded here as a whole. It is NOT third-party
+# dead weight -- it is our CPU-specialised fork and the most valuable thing in
+# this repo, so it ships (decided 2026-10-11). Only its build output, test
+# vocabularies and the parked fork history are excluded; see the block at the
+# bottom of this file.
+bitnet-b1.58-2B-4T-bf16/
+glm-edge-4b-chat/
+MiniCPM5-1B/
+MiniCPM5-2B-gguf/
+Nanbeige4.2-3B/
+Qwen3-0.6B/
+Qwen3-TTS-12Hz-0.6B-Base/
+Qwen3-TTS-12Hz-1.7B-VoiceDesign/
+Qwen3.5-0.8B/
+Qwen3.5-2B-GGUF/
+
+# The custom Live2D model. VTube Studio exports carry per-model redistribution
+# terms, and regardless of legality this one is your personal character artwork.
+# Ship the integration (model3.json wiring, emotion ids) without the assets.
+Open-LLM-VTuber/live2d-models/shufulei/
+舒芙蕾/
+
+# ---------------------------------------------------------------------------
+# 发布前收敛补丁 (2026-10-11)
+# 背景：上面那些规则是照"排除第三方权重"这个心智模型写的，对**我们自己产出的**
+# 运行时/缓存几乎全漏。实测 `git add -A` 会收走 72,497 个文件，其中 71,575 个是
+# 环境垃圾。下面每条都对应一个实测到的具体漏网路径。
+# ---------------------------------------------------------------------------
+
+# uv 包缓存：39,207 个文件，纯本机构建产物，与代码无关。
+.uvcache/
+
+# venv 变体。注意 `.venv/` 只匹配**名为** .venv 的目录：Open-LLM-VTuber/.venv
+# 和根 .venv 被忽略了，但 .venv-qwentts / .venv-kokoro 一直漏着（32,368 个文件）。
+.venv-*/
+
+# 声纹参考音频。几秒音频就够克隆一把嗓子，这是最该兜住的一类。
+# RELEASE.md 早已判定"默认不发"，但此前没有任何规则实现它 —— 文档写了，规则没写。
+models/speaker_refs/
+
+# 递归版本。顶层 glob（models/*.gguf）匹配不到子目录，
+# 于是 models/qwen3-4b-base/*.safetensors (7.5G) 和 models/kokoro/* 直接漏网。
+models/**/*.gguf
+models/**/*.bin
+models/**/*.safetensors
+models/**/*.onnx
+models/**/*.npz
+
+# ctest 运行时产物。同样的问题：ctest/*.wav 只匹配顶层，
+# ctest/voice_ab/ 下 255 个 wav + 7 个 mp3 全漏。
+ctest/**/*.wav
+ctest/**/*.mp3
+ctest/voice_ab/
+ctest/*.pid
+ctest/login_qr.png
+
+# ---------------------------------------------------------------------------
+# 第三方资产（沿用 2026-10-04 拍板的边界：仅发布源代码，权重与形象都不上传）
+# ---------------------------------------------------------------------------
+
+# sherpa-onnx SenseVoice ASR 权重，228 MB。
+# 两个理由都必须排：① 它是权重，越出既定边界；② **GitHub 单文件硬限 100 MB**，
+# 留着整个 push 会被直接拒绝。conf.yaml 里 asr_model: 'sherpa_onnx_asr' 是开着的，
+# 但我们的主链路是弹幕文本驱动，ASR 只服务于 ctest/asr_verify.py 的反读验证，
+# 不发布影响很小 —— 获取方式写进 ASSETS.md 即可。
+Open-LLM-VTuber/models/
+
+# 运行时 TTS 缓存，每次跑都会再长出来。
+Open-LLM-VTuber/cache/
+
+# Open-LLM-VTuber 自带的两个示例 Live2D 形象。和舒芙蕾是同一类问题：
+# 仓库是 MIT，但 MIT 只覆盖代码，不覆盖它 vendor 进来的第三方形象资产。
+# 我们自己需要的是「怎么接 Live2D」（model3.json 接线、表情 id），不是这两个模型。
+Open-LLM-VTuber/live2d-models/mao_pro/
+Open-LLM-VTuber/live2d-models/shizuku/
+
+# speculative decoding 那条线已证伪，只留下这几个 tokenizer json。
+models/qwen3-4b-base/
+
+# ---------------------------------------------------------------------------
+# llama.cpp fork：要发布，但要挑着发（2026-10-11 拍板）
+# ---------------------------------------------------------------------------
+# 整个目录 497 MB，其中 build/ 就占 332 MB。build/ 不只是"编译产物"那么简单 ——
+# scrub_scan 显示它是本项目隐私命中的唯一来源：
+#   CMakeCache.txt        Windows 用户名「华为」3 处
+#   compile_commands.json 里 2338 处本机绝对路径
+#   CMakeConfigureLog.yaml / TargetDirectories.txt / InstallScripts.json 同上
+# 排除 build/ 之后，llama.cpp 源码侧隐私扫描为零命中。
+# （它自带的 .gitignore 也排了 /build* 和 *.log，这里是主仓层面的双保险。）
+
+llama.cpp/build/
+llama.cpp/build*/
+llama.cpp/out/
+
+# 上游自带的测试 vocab（models/ggml-vocab-*.gguf，121 个 / 74 MB）。
+# 是 .gguf 权重格式，按既定边界「仅发布源代码」一律不发；
+# 且它们只服务于上游 tests，与我们的 CPU 调优无关。
+# 注意 llama.cpp 自己的 .gitignore 有一条 !/models/ggml-vocab-*.gguf* 例外
+# 专门要把它们捞回来，所以必须在主仓层面盖掉。
+llama.cpp/models/
+
+# ---------------------------------------------------------------------------
+# 运行输出快照：不是源码，且每条都印着本机绝对路径
+# ---------------------------------------------------------------------------
+# ctest/ 下一批 benchmark / probe 的产物（np_*.json 是并发测速、o*.json 是
+# completion 响应、ctx_*/fa*/long_*/spec_* 是打印了 model 路径的运行日志）。
+# 判据很干净：**含本机绝对路径的必然是输出** —— 输入模板不会硬编码
+# 路径，所以 `s1.json` `req.json` `prompt.txt` 这类输入文件不在排除范围内，
+# 别用 `ctest/*.json` 这种宽规则误伤它们（ttft_server2.sh 用 `-d @s1.json` 读输入）。
+# 只从仓库移除，本地文件保留。
+ctest/np_*.json
+ctest/o1.json
+ctest/o2.json
+ctest/resp_self.json
+ctest/ctx_dbg.txt
+ctest/ctx_run.txt
+ctest/fa.txt
+ctest/fa_run.txt
+ctest/g.txt
+ctest/long_*.txt
+ctest/nospec.txt
+ctest/scan.txt
+ctest/spec_ngramcache.txt
+ctest/spec_ab/
+
+# fork 的原 .git 被改名停放（见 patches/README.md）。改名而不是删除，
+# 是为了让 git 不再把 llama.cpp 当成嵌套仓库 —— 否则 `git add` 只记录一个
+# gitlink，clone 的人拿不到任何源码。历史一点没丢，改名回来即可恢复。
+llama.cpp/.git.fork-backup/

@@ -1,0 +1,50 @@
+[
+    {
+        "name": "mao_pro",
+        "description": "",
+        "url": "/live2d-models/mao_pro/runtime/mao_pro.model3.json",
+        "kScale": 0.5,
+        "initialXshift": 0,
+        "initialYshift": 0,
+        "kXOffset": 1150,
+        "idleMotionGroupName": "Idle",
+        "emotionMap": {
+            "neutral": 0,
+            "anger": 2,
+            "disgust": 2,
+            "fear": 1,
+            "joy": 3,
+            "smirk": 3,
+            "sadness": 1,
+            "surprise": 3
+        },
+        "tapMotions": {
+            "HitAreaHead": {
+                "": 1
+            },
+            "HitAreaBody": {
+                "": 1
+            }
+        }
+    },
+    {
+        "name": "shufulei",
+        "description": "舒芙蕾 (Cubism 4). 原始 model3.json 未引用任何 Motions/Expressions，已补全；IDLE 动作只驱动眼泪参数，待机主要靠 physics。无 HitAreas，故点击无反馈。",
+        "url": "/live2d-models/shufulei/shufulei.model3.json",
+        "kScale": 0.5,
+        "initialXshift": 0,
+        "initialYshift": 0,
+        "kXOffset": 1150,
+        "idleMotionGroupName": "Idle",
+        "emotionMap": {
+            "neutral": 0,
+            "anger": 2,
+            "disgust": 6,
+            "fear": 3,
+            "joy": 5,
+            "smirk": 1,
+            "sadness": 3,
+            "surprise": 4
+        }
+    }
+]

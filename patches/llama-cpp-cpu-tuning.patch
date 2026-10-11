@@ -1,0 +1,1817 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 63e3427..8ff16a4 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1763,6 +1763,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
+                            }
+                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
++    add_opt(common_arg(
++        { "-fakv", "--fa-kv-threshold" }, "N",
++        string_format("[CPU-SPEC] with -fa auto, use flash attention only while the KV length is <= N "
++                      "(0 = always use flash attention, default: %d)", params.fa_kv_threshold),
++        [](common_params & params, int value) {
++            params.fa_kv_threshold = value;
++        }
++    ));
++    add_opt(common_arg(
++        { "-fatok", "--fa-max-tokens" }, "N",
++        string_format("[CPU-SPEC] with -fa auto, switch away from flash attention only when the ubatch has <= N tokens "
++                      "(0 = never switch, default: %d)", params.fa_max_tokens),
++        [](common_params & params, int value) {
++            params.fa_max_tokens = value;
++        }
++    ));
+     add_opt(common_arg(
+         {"-p", "--prompt"}, "PROMPT",
+         "prompt to start generation with; for system message, use -sys",
+diff --git a/common/common.cpp b/common/common.cpp
+index a316b2a..d1bfa3a 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1740,6 +1740,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.pooling_type      = params.pooling_type;
+     cparams.attention_type    = params.attention_type;
+     cparams.flash_attn_type   = params.flash_attn_type;
++    cparams.fa_kv_threshold   = params.fa_kv_threshold;
++    cparams.fa_max_tokens     = params.fa_max_tokens;
+     cparams.cb_eval           = params.cb_eval;
+     cparams.cb_eval_user_data = params.cb_eval_user_data;
+     cparams.offload_kqv       = !params.no_kv_offload;
+diff --git a/common/common.h b/common/common.h
+index 39f855c..52f1780 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -498,6 +498,10 @@ struct common_params {
+     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
+     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
+ 
++    // [CPU-SPEC] adaptive flash attention (only used with flash_attn_type == AUTO)
++    int32_t fa_kv_threshold = 2048; // use FA while n_kv <= this, else legacy (0 = always FA)
++    int32_t fa_max_tokens   = 1;    // switch away from FA only when n_tokens <= this (0 = never)
++
+     struct common_params_sampling    sampling;
+     struct common_params_speculative speculative;
+     struct common_params_diffusion   diffusion;
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 224bdef..c9a651d 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -601,6 +601,12 @@ extern "C" {
+ 
+         GGML_OP_GLU,
+ 
++        // [CPU-SPEC] Spec 03: transposed-quantized matmul used by the legacy attention path
++        //   when the V cache is quantized. dst = sum_t kq[t] * to_float(v[., t, .]),
++        //   with v stored in the flash-attn layout (head_dim contiguous -> block-addressable).
++        //   appended at the TAIL on purpose: inserting in the middle shifts every enum value.
++        GGML_OP_MUL_MAT_TQ,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -1484,6 +1490,20 @@ extern "C" {
+             struct ggml_tensor  * a,
+             struct ggml_tensor  * b);
+ 
++    // [CPU-SPEC] Spec 03: "transposed quantized" matmul.
++    //   kq : [T, N, Hq,  S] F32   (output of soft_max_ext on the legacy attention path)
++    //   v  : [D, T, Hkv, S]       (flash-attn layout; any type with a to_float, incl. quantized)
++    //   dst: [D, N, Hq,  S] F32   same shape as ggml_mul_mat(cont(transpose(v)), kq)
++    //
++    //   dst[d,n,h,s] = sum_t kq[t,n,h,s] * to_float(v)[d,t,h/rk,s]     rk = Hq / Hkv
++    //
++    //   mathematically identical to mul_mat on a materialized transposed V, but the V rows are
++    //   dequantized on the fly -> no 940 MiB/token transpose round-trip (benchmark_results.md §12).
++    GGML_API struct ggml_tensor * ggml_mul_mat_tq(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * kq,
++            struct ggml_tensor  * v);
++
+     // change the precision of a matrix multiplication
+     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
+     GGML_DEPRECATED(GGML_API void ggml_mul_mat_set_prec(
+diff --git a/ggml/src/ggml-cpu/common.h b/ggml/src/ggml-cpu/common.h
+index abbadc3..60f2b0d 100644
+--- a/ggml/src/ggml-cpu/common.h
++++ b/ggml/src/ggml-cpu/common.h
+@@ -9,6 +9,16 @@
+ #define GGML_FA_TILE_Q  64
+ #define GGML_FA_TILE_KV 64
+ 
++// [CPU-SPEC] Spec 03 §5.1: batch size (kq->ne[1]) above which ggml_mul_mat_tq switches from the
++//   partials-based decode kernel (mode one) to the direct-write prefill kernel (mode two).
++//   shared by the wsize planner (ggml-cpu.c) and the kernel (ops.cpp) so the two can never
++//   disagree about which mode will run.
++#define GGML_MUL_MAT_TQ_MAX_N 16
++
++// [CPU-SPEC] Spec 03 §5.1: the dequantized V row lives on the stack, so head_dim is bounded.
++//   models in this repo use 128; 512 is a generous ceiling (2 KB of stack per thread).
++#define GGML_MUL_MAT_TQ_MAX_D 512
++
+ #ifdef __cplusplus
+ 
+ #include <utility>
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 8bb0ff7..548f5dc 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2041,6 +2041,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+                 bool masked = t != 0;
+                 ggml_compute_forward_flash_attn_back(params, masked, tensor);
+             } break;
++        case GGML_OP_MUL_MAT_TQ:
++            {
++                ggml_compute_forward_mul_mat_tq(params, tensor);
++            } break;
+         case GGML_OP_SSM_CONV:
+             {
+                 ggml_compute_forward_ssm_conv(params, tensor);
+@@ -2431,6 +2435,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+         case GGML_OP_TOP_K:
+         case GGML_OP_FLASH_ATTN_EXT:
+         case GGML_OP_FLASH_ATTN_BACK:
++        case GGML_OP_MUL_MAT_TQ:
+         case GGML_OP_SSM_CONV:
+         case GGML_OP_SSM_SCAN:
+         case GGML_OP_LIGHTNING_INDEXER:
+@@ -3009,6 +3014,43 @@ struct ggml_cplan ggml_graph_plan(
+ 
+                         cur += MAX(prefill, decode);
+                     } break;
++                case GGML_OP_MUL_MAT_TQ:
++                    {
++                        // [CPU-SPEC] Spec 03 §5.1. only "mode one" (small batch, N <= 16) needs
++                        //   scratch: token chunks are reduced through partials so that the
++                        //   dequantized V row is shared across all query heads of a kv group.
++                        //   mode two (prefill) writes dst directly -> no wdata at all.
++                        const int64_t N  = node->src[0]->ne[1];
++                        const int64_t Hq = node->src[0]->ne[2];
++                        const int64_t S  = node->src[0]->ne[3];
++                        const int64_t D  = node->src[1]->ne[0];
++                        const int64_t T  = node->src[1]->ne[1];
++
++                        // LLAMA_TQ_MODE forces one branch on a batch that would normally take the
++                        //   other one, so the scratch presence has to follow the same decision the
++                        //   kernel makes - get this wrong and the forced run scribbles past ->wsize.
++                        int force_mode = 0;
++                        {
++                            const char * env_mode = getenv("LLAMA_TQ_MODE");
++                            if (env_mode) {
++                                force_mode = atoi(env_mode);
++                            }
++                        }
++
++                        if (force_mode == 1 || (force_mode == 0 && N <= GGML_MUL_MAT_TQ_MAX_N)) {
++                        int64_t n_chunk = MIN(n_tasks, T);
++                        {
++                            const char * env_nc = getenv("LLAMA_TQ_NCHUNK");
++                            if (env_nc) {
++                                const int64_t nc = atoi(env_nc);
++                                if (nc >= 1) {
++                                    n_chunk = MIN(nc, T);
++                                }
++                            }
++                        }
++                        cur += sizeof(float)*S*n_chunk*Hq*N*D;
++                        }
++                    } break;
+                 case GGML_OP_FLASH_ATTN_BACK:
+                     {
+                         const int64_t    D = node->src[0]->ne[0];
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index ba00a0a..47fc78a 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8611,6 +8611,179 @@ void ggml_compute_forward_top_k(
+     }
+ }
+ 
++// [CPU-SPEC][Spec 02] ---------------------------------------------------------------------------
++// Why this block exists:
++//   In decode, a GQA model maps several query heads to one kv head, but the f16 attention kernel
++//   loops  {for each q row} {for each token}  - so every query head of a kv group re-reads the
++//   whole K/V of that group. Measured KV traffic multiplier on this machine (ctx=8192, t=12):
++//     alpha ~ 2.2 for Qwen3-0.6B (GQA ratio 2), ~3.4 for Qwen3-4B / glm-edge-4b (ratio 4)
++//   at ctx=8192 this is what makes FA ~2x slower than the legacy attention path.
++//   Evidence: ctest/benchmark_results.md S12 and S12.7.
++//
++// The fix swaps the loop order inside a kv group: read each K/V row once, then hand it to every
++// query head of that group. KV traffic multiplier goes from the GQA ratio down to 1.
++//
++// Scope: pure single-row decode only (neq1 == 1 && neq3 == 1). Everything else falls back to the
++// unmodified kernel - the exact list is in the `use_gqa` predicate further down.
++// Roll back without recompiling: LLAMA_FA_GQA=0.
++// ----------------------------------------------------------------------------------------------
++
++// Upper bounds for the on-stack scratch used by the grouped kernel. These run on pool worker
++// threads, so we cap both the number of simultaneously live accumulators and their width instead
++// of using heap allocation on the hot path. Models beyond these bounds simply fall back.
++static constexpr int64_t FA_GQA_MAX_RK2  =    8; // max query heads per kv head (Qwen2/3-72B=8, Gemma=8)
++static constexpr int64_t FA_GQA_MAX_DV   =  256; // max value head dim
++static constexpr int64_t FA_GQA_MAX_QROW = 1024; // max bytes for one converted Q row (DK * widest vec_dot type)
++
++// Minimum context length for the grouped kernel to pay off. See the `use_gqa` predicate for the
++// measurement behind this number (ctx<=2048 is slower with grouping, ctx>=4096 is faster).
++static constexpr int64_t FA_GQA_MIN_TOKENS = 4096;
++
++static bool ggml_fa_gqa_enabled(void) {
++    // Read once, never on the hot path.
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_FA_GQA");
++        return !(env && atoi(env) == 0);
++    }();
++    return enabled;
++}
++
++static inline size_t ggml_fa_gqa_row_bytes(const size_t n) {
++    return (n + 31) & ~(size_t) 31;
++}
++
++// The per-(query head, token) arithmetic of the f16 attention kernel, extracted verbatim from the
++// ic-loop of ggml_compute_forward_flash_attn_ext_f16_one_chunk(). Both that kernel and the grouped
++// kernel below call this single copy, so the two cannot drift apart. Do not "improve" anything in
++// here: reordering these operations changes rounding and breaks bit-exactness, which is the only
++// correctness check available on this machine (llama-perplexity segfaults here).
++static inline void ggml_fa_f16_step(
++        const int64_t DK, const int64_t DV,
++        const float scale, const float logit_softcap,
++        ggml_vec_dot_t kq_vec_dot, ggml_to_float_t v_to_float, const ggml_type v_type,
++        const char * k_data, const char * v_data, const ggml_fp16_t * Q_q, const float mv,
++        float * V32, float * VKQ32, ggml_fp16_t * VKQ16,
++        float & S, float & M) {
++
++    float s; // KQ value
++
++    kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
++
++    s = s*scale; // scale KQ value
++
++    if (logit_softcap != 0.0f) {
++        s = logit_softcap*tanhf(s);
++    }
++
++    s += mv; // apply mask
++
++    const float Mold = M;
++
++    float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
++    float vs = 1.0f; // post-softmax KQ value, expf(s - M)
++
++    if (v_type == GGML_TYPE_F16) {
++        if (s > M) {
++            // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
++            M = s;
++            ms = expf(Mold - M);
++
++            // V = V*expf(Mold - M)
++            ggml_vec_scale_f16(DV, VKQ16, ms);
++        } else {
++            // no new maximum, ms == 1.0f, vs != 1.0f
++            vs = expf(s - M);
++        }
++
++        // V += v*expf(s - M)
++        ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
++    } else {
++        if (s > M) {
++            // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
++            M = s;
++            ms = expf(Mold - M);
++
++            // V = V*expf(Mold - M)
++            ggml_vec_scale_f32(DV, VKQ32, ms);
++        } else {
++            // no new maximum, ms == 1.0f, vs != 1.0f
++            vs = expf(s - M);
++        }
++
++        // V += v*expf(s - M)
++        if (v_to_float) {
++            v_to_float(v_data, V32, DV);
++            ggml_vec_mad_f32(DV, VKQ32, V32, vs);
++        } else {
++            // V is F32
++            ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
++        }
++    }
++
++    S = S*ms + vs; // scale and increment sum with partial sum
++}
++
++// The per-query-head tail of the same kernel, also extracted verbatim: fp16 -> fp32 conversion of
++// the accumulator, sink token rescale, normalization and the final write (to dst or to partials).
++// Shared for the same reason as ggml_fa_f16_step().
++//   v is F16     -> VKQ32 is the fp32 scratch to write, VKQ16 holds the accumulated rows
++//   v is not F16 -> VKQ32 is the accumulator itself and VKQ16 is unused
++static inline void ggml_fa_f16_finalize(
++        ggml_tensor * dst, const int64_t DV, const ggml_type v_type,
++        const ggml_tensor * sinks, const bool apply_sinks,
++        const int64_t ir, const int iq1, const int iq2, const int iq3, const int h,
++        float * partials, const int64_t partial_stride,
++        float * VKQ32, const ggml_fp16_t * VKQ16, float & S, float & M) {
++
++    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
++    GGML_TENSOR_LOCALS(size_t,  nb, dst, nb)
++
++    if (v_type == GGML_TYPE_F16) {
++        for (int64_t d = 0; d < DV; ++d) {
++            VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
++        }
++    }
++
++    // sinks - apply only on the first kv-chunk
++    if (sinks && apply_sinks) {
++        const float s = ((float *)((char *) sinks->data))[h];
++
++        float ms = 1.0f;
++        float vs = 1.0f;
++
++        if (s > M) {
++            ms = expf(M - s);
++            M = s;
++            ggml_vec_scale_f32(DV, VKQ32, ms);
++        } else {
++            vs = expf(s - M);
++        }
++
++        S = S*ms + vs;
++    }
++
++    if (partials) {
++        // Write M, S, VKQ to partials for later reduction
++        // partials layout: [M, S, VKQ[DV]] per query head
++        float * partial = partials + ir * partial_stride;
++        partial[0] = M;
++        partial[1] = S;
++        memcpy(partial + 2, VKQ32, DV * sizeof(float));
++    } else {
++        // V /= S
++        const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
++        ggml_vec_scale_f32(DV, VKQ32, S_inv);
++
++        // dst indices
++        const int i1 = iq1;
++        const int i2 = iq2;
++        const int i3 = iq3;
++
++        // permute(0, 2, 1, 3)
++        memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
++    }
++}
++
+ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+@@ -8618,7 +8791,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         int64_t ic_start, int64_t ic_end,
+         float * partials, int64_t partial_stride) {
+ 
+-    const bool write_partials = (partials != nullptr);
++    // note: `partials != nullptr` doubles as the "write partials instead of dst" flag, see
++    //       ggml_fa_f16_finalize(). Extracted there so both kernels use one copy of the write logic.
+     const ggml_tensor * q     = dst->src[0];
+     const ggml_tensor * k     = dst->src[1];
+     const ggml_tensor * v     = dst->src[2];
+@@ -8741,110 +8915,212 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                 continue;
+             }
+ 
+-            float s; // KQ value
+-
+             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
++            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+ 
+-            s = s*scale; // scale KQ value
++            ggml_fa_f16_step(DK, DV, scale, logit_softcap, kq_vec_dot, v_to_float, v->type,
++                             k_data, v_data, Q_q, mv, V32, VKQ32, VKQ16, S, M);
++        }
+ 
+-            if (logit_softcap != 0.0f) {
+-                s = logit_softcap*tanhf(s);
+-            }
++        ggml_fa_f16_finalize(dst, DV, v->type, sinks, ic_start == 0,
++                             ir, iq1, iq2, iq3, (int) h, partials, partial_stride, VKQ32, VKQ16, S, M);
++    }
++}
+ 
+-            s += mv; // apply mask
++// [CPU-SPEC][Spec 02] Grouped decode kernel for GQA models.
++//
++//   ungrouped (existing) :  for each q head   { for each token { load K/V } }
++//   grouped   (this one) :  for each kv group { for each token { load K/V once; reuse for every
++//                                                                q head of the group } }
++//
++// Identical arithmetic per (q head, token) - see ggml_fa_f16_step() - so the output is unchanged,
++// while KV traffic per token drops from (q heads per kv head) x down to 1x. That factor is exactly
++// the 2x-4x bandwidth penalty measured in benchmark_results.md S12.
++//
++// Caller contract (all checked by the `use_gqa` predicate before dispatch):
++//   neq1 == 1 && neq3 == 1          -> the row index ir IS the q head index
++//   neq2 % nek2 == 0 && nev2 == nek2 -> uniform groups, k and v share the same head index for a group
++//   rk2 in [2, FA_GQA_MAX_RK2]       -> there is reuse to win, and the live state stays small
++//   DV <= FA_GQA_MAX_DV, row fits     -> scratch stays inside the fixed stack buffers below
++//   [ir0, ir1) aligned to rk2        -> no group is split across two threads
++static void ggml_compute_forward_flash_attn_ext_f16_gqa(
++        const ggml_compute_params * params,
++        ggml_tensor * dst,
++        int64_t ir0, int64_t ir1,
++        int64_t ic_start, int64_t ic_end,
++        float * partials, int64_t partial_stride) {
+ 
+-            const float Mold = M;
++    const ggml_tensor * q     = dst->src[0];
++    const ggml_tensor * k     = dst->src[1];
++    const ggml_tensor * v     = dst->src[2];
++    const ggml_tensor * mask  = dst->src[3];
++    const ggml_tensor * sinks = dst->src[4];
+ 
+-            float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
+-            float vs = 1.0f; // post-softmax KQ value, expf(s - M)
++    GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbk, k,   nb)
++    GGML_TENSOR_LOCALS(int64_t, nev, v,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nbv, v,   nb)
++    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
++    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
+ 
+-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
++    const int64_t DK = nek0;
++    const int64_t DV = nev0;
++    const int64_t N  = neq1;
+ 
+-            if (v->type == GGML_TYPE_F16) {
+-                if (s > M) {
+-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+-                    M = s;
+-                    ms = expf(Mold - M);
++    GGML_ASSERT(ne0 == DV);
++    GGML_ASSERT(ne2 == N);
+ 
+-                    // V = V*expf(Mold - M)
+-                    ggml_vec_scale_f16(DV, VKQ16, ms);
+-                } else {
+-                    // no new maximum, ms == 1.0f, vs != 1.0f
+-                    vs = expf(s - M);
+-                }
++    GGML_ASSERT(nbq0 == ggml_type_size(q->type));
++    GGML_ASSERT(nbk0 == ggml_type_size(k->type));
++    GGML_ASSERT(nbv0 == ggml_type_size(v->type));
+ 
+-                // V += v*expf(s - M)
+-                ggml_vec_mad_f16(DV, VKQ16, (const ggml_fp16_t *) v_data, vs);
+-            } else {
+-                if (s > M) {
+-                    // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
+-                    M = s;
+-                    ms = expf(Mold - M);
++    GGML_ASSERT(neq0 == DK);
++    GGML_ASSERT(nek0 == DK);
++    GGML_ASSERT(nev0 == DV);
+ 
+-                    // V = V*expf(Mold - M)
+-                    ggml_vec_scale_f32(DV, VKQ32, ms);
+-                } else {
+-                    // no new maximum, ms == 1.0f, vs != 1.0f
+-                    vs = expf(s - M);
+-                }
++    // caller contract: pure single-row decode, uniform grouping, no partial group
++    GGML_ASSERT(N == 1);
++    GGML_ASSERT(neq3 == 1);
++    GGML_ASSERT(ir0 % (neq2/nek2) == 0);
++    GGML_ASSERT(ir1 % (neq2/nek2) == 0 || ir1 == neq2);
+ 
+-                // V += v*expf(s - M)
+-                if (v_to_float) {
+-                    v_to_float(v_data, V32, DV);
+-                    ggml_vec_mad_f32(DV, VKQ32, V32, vs);
+-                } else {
+-                    // V is F32
+-                    ggml_vec_mad_f32(DV, VKQ32, (const float *) v_data, vs);
+-                }
+-            }
++    // broadcast factors
++    const int64_t rk2 = neq2/nek2;
++    const int64_t rv2 = neq2/nev2;   // == rk2 by contract
+ 
+-            S = S*ms + vs; // scale and increment sum with partial sum
+-        }
++    // iq3 is always 0 here (neq3 == 1), so the dim-3 indices are 0 for every head of the group
++    const int ik3 = 0;
++    const int iv3 = 0;
+ 
+-        if (v->type == GGML_TYPE_F16) {
+-            for (int64_t d = 0; d < DV; ++d) {
+-                VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
+-            }
+-        }
++    GGML_ASSERT(rk2 > 1);
++    GGML_ASSERT(nek2 == nev2);
+ 
+-        // sinks - apply only on the first kv-chunk
+-        if (sinks && ic_start == 0) {
+-            const float s = ((float *)((char *) sinks->data))[h];
++    float scale         = 1.0f;
++    float max_bias      = 0.0f;
++    float logit_softcap = 0.0f;
++
++    memcpy(&scale,         (float *) dst->op_params + 0, sizeof(float));
++    memcpy(&max_bias,      (float *) dst->op_params + 1, sizeof(float));
++    memcpy(&logit_softcap, (float *) dst->op_params + 2, sizeof(float));
++
++    if (logit_softcap != 0) {
++        scale /= logit_softcap;
++    }
+ 
+-            float ms = 1.0f;
+-            float vs = 1.0f;
++    const uint32_t n_head      = neq2;
++    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
++
++    const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
++    const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
++
++    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
++    ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
++    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
++    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
++
++    GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
++    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
++
++    // this kernel keeps its accumulators in stack scratch instead of params->wdata, so that several
++    // heads can be live at once without changing the worker buffer budget - hence no use of params
++    GGML_UNUSED(params);
+ 
+-            if (s > M) {
+-                ms = expf(M - s);
+-                M = s;
+-                ggml_vec_scale_f32(DV, VKQ32, ms);
++    const bool v_f16 = (v->type == GGML_TYPE_F16);
++
++    // Stack scratch: one converted Q row + one VKQ accumulator per q head of the group, plus one
++    // shared row. The shared row has two roles that never overlap in time - fp32 V buffer while V
++    // is not f16, and the fp32 output row while it is - so one buffer serves both. All rows are
++    // padded to 32B so that every per-head start stays SIMD aligned; no heap allocation per step.
++    alignas(32) char buf_q  [FA_GQA_MAX_RK2*FA_GQA_MAX_QROW];
++    alignas(32) char buf_vkq[FA_GQA_MAX_RK2*FA_GQA_MAX_DV*sizeof(float)];
++    alignas(32) char buf_tmp[                FA_GQA_MAX_DV*sizeof(float)];
++
++    const size_t row_q   = ggml_fa_gqa_row_bytes(ggml_row_size(k_vec_dot_type, DK));
++    const size_t row_vkq = ggml_fa_gqa_row_bytes(v_f16 ? DV*sizeof(ggml_fp16_t) : DV*sizeof(float));
++
++    GGML_ASSERT(rk2       <= FA_GQA_MAX_RK2);
++    GGML_ASSERT(DV        <= FA_GQA_MAX_DV);
++    GGML_ASSERT(row_q     <= FA_GQA_MAX_QROW);
++    GGML_ASSERT(row_q*rk2 <= sizeof(buf_q));
++    GGML_ASSERT(row_vkq*rk2 <= sizeof(buf_vkq));
++    GGML_ASSERT(DV*sizeof(float) <= sizeof(buf_tmp));
++
++    for (int64_t g = ir0; g < ir1; g += rk2) {
++        const int64_t nh = std::min(rk2, ir1 - g);
++
++        ggml_fp16_t       * Q_q  [FA_GQA_MAX_RK2];
++        const ggml_fp16_t * mp   [FA_GQA_MAX_RK2];
++        float               S    [FA_GQA_MAX_RK2];
++        float               M    [FA_GQA_MAX_RK2];
++        float               slope[FA_GQA_MAX_RK2];
++        float             * VKQ32[FA_GQA_MAX_RK2];
++        ggml_fp16_t      * VKQ16 [FA_GQA_MAX_RK2];
++
++        // k/v head index of this group - constant across the group by construction
++        const int ik2 = (int) (g / rk2);
++        const int iv2 = (int) (g / rv2);
++
++        for (int64_t j = 0; j < nh; ++j) {
++            // ir == iq2 because neq1 == 1 && neq3 == 1
++            const int64_t  ir  = g + j;
++            const int      iq1 = 0;
++            const int      iq2 = (int) ir;
++            const int      iq3 = 0;
++            const uint32_t hh  = (uint32_t) iq2;
++
++            Q_q  [j] = (ggml_fp16_t *) (buf_q   + j*row_q);
++            VKQ32[j] = v_f16 ? nullptr : (float       *) (buf_vkq + j*row_vkq);
++            VKQ16[j] = v_f16 ? (ggml_fp16_t *) (buf_vkq + j*row_vkq) : nullptr;
++
++            if (v_f16) {
++                memset(VKQ16[j], 0, DV*sizeof(ggml_fp16_t));
+             } else {
+-                vs = expf(s - M);
++                memset(VKQ32[j], 0, DV*sizeof(float));
+             }
+ 
+-            S = S*ms + vs;
++            mp   [j] = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
++            slope[j] = (max_bias > 0.0f) ? hh < n_head_log2 ? powf(m0, hh + 1) : powf(m1, 2*(hh - n_head_log2) + 1) : 1.0f;
++
++            S[j] = 0.0f;
++            M[j] = -INFINITY;
++
++            // Converting Q is hoisted out of the token loop. Same call with the same arguments as
++            // the ungrouped kernel issues for this head, so the converted row is identical.
++            const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
++            q_to_vec_dot(pq, Q_q[j], DK);
+         }
+ 
+-        if (write_partials) {
+-            // Write M, S, VKQ to partials for later reduction
+-            // partials layout: [M, S, VKQ[DV]] per query head
+-            float * partial = partials + ir * partial_stride;
+-            partial[0] = M;
+-            partial[1] = S;
+-            memcpy(partial + 2, VKQ32, DV * sizeof(float));
+-        } else {
+-            // V /= S
+-            const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+-            ggml_vec_scale_f32(DV, VKQ32, S_inv);
++        // online softmax / attention
++        // loop over n_kv and n_head_kv
++        // ref: https://arxiv.org/pdf/2112.05682.pdf
++        //
++        // K/V rows are loaded once per group here; in the ungrouped kernel every q head loads them
++        // again. This single swap is the whole point of this function.
++        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
++            const char * k_data = (const char *) k->data + (ic*nbk1 + ik2*nbk2 + ik3*nbk3);
++            const char * v_data = (const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3);
+ 
+-            // dst indices
+-            const int i1 = iq1;
+-            const int i2 = iq2;
+-            const int i3 = iq3;
++            for (int64_t j = 0; j < nh; ++j) {
++                const float mv = mp[j] ? slope[j]*GGML_CPU_FP16_TO_FP32(mp[j][ic]) : 0.0f;
++                if (mv == -INFINITY) {
++                    continue;
++                }
+ 
+-            // permute(0, 2, 1, 3)
+-            memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
++                ggml_fa_f16_step(DK, DV, scale, logit_softcap, kq_vec_dot, v_to_float, v->type,
++                                 k_data, v_data, Q_q[j], mv, (float *) buf_tmp, VKQ32[j], VKQ16[j], S[j], M[j]);
++            }
++        }
++
++        // tail is per q head and goes through the same shared finalize() as the ungrouped kernel
++        for (int64_t j = 0; j < nh; ++j) {
++            const int64_t ir  = g + j;
++            const int     iq2 = (int) ir;
++
++            ggml_fa_f16_finalize(dst, DV, v->type, sinks, ic_start == 0,
++                                 ir, 0, iq2, 0, iq2, partials, partial_stride,
++                                 v_f16 ? (float *) buf_tmp : VKQ32[j], VKQ16[j], S[j], M[j]);
+         }
+     }
+ }
+@@ -9260,6 +9536,40 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+ 
++    // [CPU-SPEC][Spec 02] Can this op be served by the grouped (KV-reusing) decode kernel?
++    // Every condition below is a hard requirement of that kernel, not a tuning heuristic:
++    //   neq1 == 1 && neq3 == 1  : it treats the row index directly as the q head index
++    //   rk2 > 1                 : one q head per kv head means there is nothing to reuse
++    //   neq2 % nek2 == 0        : groups must be uniform, scratch is fixed size
++    //   nev2 == nek2            : k and v must agree on which head serves a given group
++    //   within RK2/DV/row caps  : bounds the stack scratch (llama does not allocate here)
++    //   nek1 >= 4096            : measured. The saving scales with the KV share of total traffic,
++    //                             so below this point it does not pay for itself: on this box
++    //                             (Qwen3-0.6B Q2_K, t=12) ctx<=2048 lands 1.4~2.6% SLOWER with the
++    //                             grouped kernel, ctx=4096 is +1.2% and ctx=8192 is +14~21%.
++    //                             This matters because the CPU fork disables FA above -fakv anyway
++    //                             (see llama-cparams.h llama_fa_enabled), so short contexts are the
++    //                             range FA is actually used in by default - do not regress it.
++    //   !use_ref                : the reference implementation must stay bit-for-bit upstream
++    //   !quantized V            : measured -10%. The grouped kernel only hoists the V *load*; the
++    //                             dequantization still runs per q head, and sharing one V32 buffer
++    //                             between the heads adds a serialization. Quantized V carries its
++    //                             own, separate defect (benchmark_results.md S12.7: alpha 5.37), so
++    //                             this path is excluded rather than half-fixed - see spec 02 S1.1.
++    //   LLAMA_FA_GQA != 0       : rollback without recompiling
++    // Deliberately independent of the k/v data type, so both the f16 path (A) and the quantized /
++    // mixed path (B) get the fix. Everything not listed here is NOT a reason to hold back.
++    const int64_t rk2 = (nek2 > 0) ? neq2/nek2 : 0;
++    const bool use_gqa = ggml_fa_gqa_enabled() &&
++        !use_ref &&
++        N == 1 && neq3 == 1 &&
++        rk2 > 1 && rk2 <= FA_GQA_MAX_RK2 &&
++        nek1 >= FA_GQA_MIN_TOKENS &&
++        nek2 > 0 && nev2 == nek2 && (neq2 % nek2) == 0 &&
++        !ggml_is_quantized(v->type) &&
++        DV <= FA_GQA_MAX_DV &&
++        ggml_row_size(ggml_get_type_traits_cpu(k->type)->vec_dot_type, DK) <= FA_GQA_MAX_QROW;
++
+     if (use_split_kv_path) {
+         const int64_t chunk_size = (nek1 + nth - 1) / nth;
+ 
+@@ -9274,10 +9584,19 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         float *       chunk_partials = partials_base + ith * partial_size;
+ 
+         if (ic_start < nek1) {
+-            for (int64_t q_head = 0; q_head < neq2; q_head++) {
+-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+-                    params, dst, q_head, q_head + 1, ic_start, ic_end,
++            if (use_gqa) {
++                // One call covers every q head of every kv head group: each K/V row of this token
++                // range is loaded once per group instead of once per head. [0, neq2) spans whole
++                // groups because use_gqa guarantees neq2 % nek2 == 0.
++                ggml_compute_forward_flash_attn_ext_f16_gqa(
++                    params, dst, 0, neq2, ic_start, ic_end,
+                     chunk_partials, partial_stride);
++            } else {
++                for (int64_t q_head = 0; q_head < neq2; q_head++) {
++                    ggml_compute_forward_flash_attn_ext_f16_one_chunk(
++                        params, dst, q_head, q_head + 1, ic_start, ic_end,
++                        chunk_partials, partial_stride);
++                }
+             }
+         } else {
+             for (int64_t q_head = 0; q_head < neq2; q_head++) {
+@@ -9297,13 +9616,36 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+         // disable for NUMA
+         const bool disable_chunking = ggml_is_numa();
+ 
++        // [CPU-SPEC][Spec 02] The grouped kernel requires each thread to own whole kv head groups,
++        // so when it is in play the row granularity is rounded up to a multiple of rk2, and the
++        // "at least nth chunks" bail-out below is skipped: there are only nek2 groups to hand out,
++        // so forcing >= nth chunks cannot create more work and would misalign the boundaries. The
++        // trade-off is that at most nek2 threads are busy here instead of neq2. This path is
++        // bandwidth bound (see S12), so cutting KV traffic by the GQA ratio is the larger effect,
++        // but it is a guess until measured - spec S5 lists it as the one open risk of this change.
++        const bool split_by_group = use_gqa && !disable_chunking;
++
+         // 4x chunks per thread
+         int nth_scaled = nth * 4;
+-        int64_t chunk_size = (nr + nth_scaled - 1) / nth_scaled;
+-        int64_t nchunk     = (nr + chunk_size - 1) / chunk_size;
++        const int64_t rows_per_chunk = (nr + nth_scaled - 1) / nth_scaled;
++
++        int64_t chunk_size;
++        int64_t nchunk;
++        int64_t dr;
++
++        if (split_by_group) {
++            chunk_size = ((rows_per_chunk + rk2 - 1) / rk2) * rk2;
++            nchunk     = (nr + chunk_size - 1) / chunk_size;
++            dr         = chunk_size;
++        } else {
++            chunk_size = rows_per_chunk;
++            nchunk     = (nr + chunk_size - 1) / chunk_size;
+ 
+-        if (nth == 1 || nchunk < nth || disable_chunking) {
+-            nchunk = nth;
++            if (nth == 1 || nchunk < nth || disable_chunking) {
++                nchunk = nth;
++            }
++
++            dr = (nr + nchunk - 1) / nchunk;
+         }
+ 
+         if (ith == 0) {
+@@ -9312,8 +9654,6 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+ 
+         ggml_barrier(params->threadpool);
+ 
+-        const int64_t dr = (nr + nchunk - 1) / nchunk;
+-
+         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
+         bool use_tiled = !use_ref &&
+                                (q->type == GGML_TYPE_F32 &&
+@@ -9336,6 +9676,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
+ 
+             if (use_tiled) {
+                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
++            } else if (split_by_group) {
++                // the whole token range for this thread: each group's K/V is read once and reused
++                // across the group's rk2 query heads. ir0/ir1 are group aligned by construction, so
++                // the kernel's contract holds.
++                ggml_compute_forward_flash_attn_ext_f16_gqa(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+             } else {
+                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+             }
+@@ -9362,6 +9707,222 @@ void ggml_compute_forward_flash_attn_ext(
+     }
+ }
+ 
++// [CPU-SPEC] Spec 03: ggml_compute_forward_mul_mat_tq
++//
++//   dst[d,n,h,s] = sum_t kq[t,n,h,s] * to_float(v)[d,t,h/rk,s]        rk = Hq / Hkv
++//
++// Why this op exists: a block-quantized V cache is only addressable in the flash-attn layout
++// (head_dim innermost and contiguous). The legacy attention path wants the transposed layout,
++// and materializing that transpose is the "note: avoid this branch" disaster at
++// llama-graph.cpp:2729 (~940 MiB/token at ctx 8192, benchmark_results.md §12).
++//
++// So instead of transposing the *data* we transpose the *loop*: each V row is dequantized once
++// and then reused by every query head of its kv group. That single property is what separates
++// this from the FA quantize-V path, which measured a 5.37x traffic multiplier because it
++// dequantized per query head (§12.7).
++//
++// Upstream equivalence: same shape and same value as ggml_mul_mat(ggml_cont(ggml_transpose(v)), kq).
++// Not bit-exact with it (f32 accumulation order differs); correctness gate is PPL - see spec §7 G1.
++
++static void ggml_compute_forward_mul_mat_tq_f32(const ggml_compute_params * params, ggml_tensor * dst) {
++    const ggml_tensor * kq = dst->src[0];
++    const ggml_tensor * v  = dst->src[1];
++
++    GGML_TENSOR_LOCALS(int64_t, ne,  dst, ne)
++    GGML_TENSOR_LOCALS(size_t,  nb,  dst, nb)
++    GGML_TENSOR_LOCALS(int64_t, ne0, kq,  ne)
++    GGML_TENSOR_LOCALS(size_t,  nb0, kq,  nb)
++    GGML_TENSOR_LOCALS(int64_t, ne1, v,   ne)
++    GGML_TENSOR_LOCALS(size_t,  nb1, v,   nb)
++
++    // dst: [D, N, Hq, S]   kq: [T, N, Hq, S]   v: [D, T, Hkv, S]
++    const int64_t D   = ne0;
++    const int64_t N   = ne01;
++    const int64_t Hq  = ne02;
++    const int64_t S   = ne03;
++    const int64_t T   = ne11;
++    const int64_t Hkv = ne12;
++
++    const int64_t ith = params->ith;
++    const int64_t nth = params->nth;
++
++    GGML_ASSERT(D   >  0 && N > 0 && Hq > 0 && T > 0 && Hkv > 0);
++    GGML_ASSERT(Hq % Hkv == 0);
++    GGML_ASSERT(D <= GGML_MUL_MAT_TQ_MAX_D);
++
++    const int64_t rk2 = Hq / Hkv; // query heads per kv head
++
++    // [CPU-SPEC] debug escape hatch for grading the two modes against each other on one batch:
++    //   they compute the same thing from the same data, so forcing LLAMA_TQ_MODE=1 or =2 must
++    //   leave every measured result unchanged. If it does not, one of them is wrong.
++    int force_mode = 0;
++    if (const char * env_mode = getenv("LLAMA_TQ_MODE")) {
++        force_mode = atoi(env_mode);
++    }
++
++    if (ith == 0 && getenv("LLAMA_TQ_DEBUG")) {
++        fprintf(stderr,
++            "[TQ] dst ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n"
++            "[TQ] kq  ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%s\n"
++            "[TQ] v   ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu] type=%s blck=%d tsize=%zu\n",
++            (long long) ne0, (long long) ne1, (long long) ne2, (long long) ne3,
++            nb0, nb1, nb2, nb3,
++            (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03,
++            nb00, nb01, nb02, nb03, ggml_type_name(kq->type),
++            (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13,
++            nb10, nb11, nb12, nb13, ggml_type_name(v->type),
++            ggml_blck_size(v->type), ggml_type_size(v->type));
++        fflush(stderr);
++    }
++
++    ggml_to_float_t const to_float = ggml_get_type_traits(v->type)->to_float;
++
++    // one dequantized V row, shared by all rk2 query heads of the group
++    float v32[GGML_MUL_MAT_TQ_MAX_D];
++
++    if (force_mode == 1 || (force_mode == 0 && N <= GGML_MUL_MAT_TQ_MAX_N)) {
++        // ---- mode one: decode / small batch -------------------------------------------------
++        // tasks are (s, token chunk) - one contiguous token run per task, every kv head inside.
++        //   Splitting tokens is what lets all nth threads work when Hkv < nth: §14.2 measured that
++        //   stopping at Hkv threads costs ~30% of the achievable bandwidth, and mode two can only
++        //   offer Hkv * ceil(N/IB) tasks, which is Hkv at decode. Each task reduces into its own
++        //   partials slice, then a second pass sums the chunks.
++        int64_t n_chunk = MIN(nth, T);
++
++        {
++            const char * env_nc = getenv("LLAMA_TQ_NCHUNK");
++            if (env_nc) {
++                const int64_t nc = atoi(env_nc);
++                if (nc >= 1) {
++                    n_chunk = MIN(nc, T);
++                }
++            }
++        }
++
++        const int64_t chunk_size = (T + n_chunk - 1) / n_chunk;
++        const int64_t n_task     = n_chunk * S;
++
++        float * partials = (float *) params->wdata;
++
++        const int64_t partial_plane = Hq * N * D;   // one (s, chunk)
++
++        // A task owns a contiguous run of tokens and walks *every* kv head inside it, rather than
++        //   owning one head across the whole context. Same arithmetic, but each thread now streams
++        //   V sequentially instead of hopping D*Hkv bytes per 136-byte row - and since 136 is not
++        //   a multiple of a cache line, the head-outer version made two or three threads pull the
++        //   same line independently. Measured on Qwen3-0.6B at ctx 8192: 16.3 -> see §15.
++        for (int64_t task = ith; task < n_task; task += nth) {
++            const int64_t chunk =  task % n_chunk;
++            const int64_t s     =  task / n_chunk;
++
++            const int64_t t0 = chunk * chunk_size;
++            const int64_t t1 = MIN(t0 + chunk_size, T);
++
++            float * p = partials + s*n_chunk*partial_plane + chunk*partial_plane;
++
++            memset(p, 0, partial_plane * sizeof(float));
++
++            if (t0 >= T) {
++                continue;
++            }
++
++            for (int64_t t = t0; t < t1; ++t) {
++                for (int64_t g = 0; g < Hkv; ++g) {
++                    const char * v_row = (const char *) v->data + s*nb13 + t*nb11 + g*nb12;
++                    to_float(v_row, v32, D);
++
++                    for (int64_t j = 0; j < rk2; ++j) {
++                        const int64_t h = g*rk2 + j;
++
++                        const char * kq_th = (const char *) kq->data + s*nb03 + h*nb02 + t*nb00;
++
++                        for (int64_t i = 0; i < N; ++i) {
++                            const float a = *(const float *) (kq_th + i*nb01);
++                            ggml_vec_mad_f32((int) D, p + (h*N + i)*D, v32, a);
++                        }
++                    }
++                }
++            }
++        }
++
++        ggml_barrier(params->threadpool);
++
++        // dst[i][h][:] = sum over token chunks
++        for (int64_t s = 0; s < S; ++s) {
++            for (int64_t h = ith; h < Hq; h += nth) {
++                for (int64_t i = 0; i < N; ++i) {
++                    float * d_row = (float *) ((char *) dst->data + s*nb3 + h*nb2 + i*nb1);
++
++                    const float * p0 = partials + s*n_chunk*partial_plane + h*N*D + i*D;
++                    memcpy(d_row, p0, D * sizeof(float));
++
++                    // z = x + y, so the destination doubles as one operand
++                    for (int64_t chunk = 1; chunk < n_chunk; ++chunk) {
++                        const float * p = partials + s*n_chunk*partial_plane + chunk*partial_plane + h*N*D + i*D;
++                        ggml_vec_add_f32((int) D, d_row, d_row, p);
++                    }
++                }
++            }
++        }
++    } else {
++        // ---- mode two: prefill -------------------------------------------------------------
++        // tasks are (s, kv head group, query block). Each task owns a disjoint set of dst rows,
++        // so it can accumulate straight into dst - no partials, no wdata, no barrier.
++        // V[g] is rescanned once per query block; at ctx 8192 that working set is ~1.1 MB and
++        // stays in L2, and kq is read exactly once in total.
++        static constexpr int64_t IB = 32;
++
++        const int64_t n_ib   = (N + IB - 1) / IB;
++        const int64_t n_task = Hkv * n_ib * S;
++
++        for (int64_t task = ith; task < n_task; task += nth) {
++            const int64_t ib =  task % n_ib;
++            const int64_t g  = (task / n_ib) % Hkv;
++            const int64_t s  =  task / (n_ib * Hkv);
++
++            const int64_t i0 = ib * IB;
++            const int64_t i1 = MIN(i0 + IB, N);
++
++            for (int64_t j = 0; j < rk2; ++j) {
++                const int64_t h = g*rk2 + j;
++                for (int64_t i = i0; i < i1; ++i) {
++                    memset((char *) dst->data + s*nb3 + h*nb2 + i*nb1, 0, D * sizeof(float));
++                }
++            }
++
++            for (int64_t t = 0; t < T; ++t) {
++                const char * v_row = (const char *) v->data + s*nb13 + t*nb11 + g*nb12;
++                to_float(v_row, v32, D);
++
++                for (int64_t j = 0; j < rk2; ++j) {
++                    const int64_t h = g*rk2 + j;
++
++                    const char * kq_th = (const char *) kq->data + s*nb03 + h*nb02 + t*nb00;
++
++                    for (int64_t i = i0; i < i1; ++i) {
++                        const float a = *(const float *) (kq_th + i*nb01);
++                        ggml_vec_mad_f32((int) D, (float *) ((char *) dst->data + s*nb3 + h*nb2 + i*nb1), v32, a);
++                    }
++                }
++            }
++        }
++    }
++}
++
++void ggml_compute_forward_mul_mat_tq(const ggml_compute_params * params, ggml_tensor * dst) {
++    switch (dst->op_params[3]) {
++        case GGML_PREC_DEFAULT:
++        case GGML_PREC_F32:
++            {
++                ggml_compute_forward_mul_mat_tq_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_flash_attn_back
+ 
+ static void ggml_compute_forward_flash_attn_back_f32(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 2728b08..c3b5d7e 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -97,6 +97,8 @@ void ggml_compute_forward_win_part(const struct ggml_compute_params * params, st
+ void ggml_compute_forward_win_unpart(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_unary(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_glu(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++// [CPU-SPEC] Spec 03: legacy attention with a quantized V cache. see specs/legacy-quant-v-op.md
++void ggml_compute_forward_mul_mat_tq(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_get_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_add_rel_pos(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rwkv_wkv6(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index cdc10a7..c47224a 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++
++    "MUL_MAT_TQ",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++
++    "x*q^t",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -3415,6 +3419,43 @@ struct ggml_tensor * ggml_mul_mat_id(
+     return result;
+ }
+ 
++// [CPU-SPEC] Spec 03: ggml_mul_mat_tq
++//
++//   dst[d,n,h,s] = sum_t kq[t,n,h,s] * to_float(v)[d,t,h/rk,s]     rk = Hq / Hkv
++//
++// same shape as ggml_mul_mat(ggml_cont(ggml_transpose(v)), kq), but V is consumed in the
++// flash-attn layout (head_dim innermost and contiguous), which is the only layout in which a
++// block-quantized V is addressable at all. see specs/legacy-quant-v-op.md §2.
++
++struct ggml_tensor * ggml_mul_mat_tq(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * kq,
++        struct ggml_tensor  * v) {
++    GGML_ASSERT(kq->type == GGML_TYPE_F32);
++    GGML_ASSERT(v->type  != GGML_TYPE_F32); // f16/bf16/quantized: anything with a to_float
++    GGML_ASSERT(!ggml_is_transposed(kq));
++    GGML_ASSERT(!ggml_is_transposed(v));
++
++    GGML_ASSERT(v->ne[3] == kq->ne[3]);
++    GGML_ASSERT(v->ne[1] == kq->ne[0]); // T (contracted dim)
++    GGML_ASSERT(v->ne[2] >  0);
++    GGML_ASSERT(kq->ne[2] % v->ne[2] == 0); // GQA broadcast: Hq % Hkv == 0
++
++    // the contracted dim of a block-quantized V is ne[0] (head_dim) in this op, so only the
++    // head_dim itself has to be block-aligned - the row stride is handled by the kernel
++    GGML_ASSERT(v->ne[0] % ggml_blck_size(v->type) == 0);
++
++    const int64_t ne[4] = { v->ne[0], kq->ne[1], kq->ne[2], kq->ne[3] };
++
++    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
++
++    result->op     = GGML_OP_MUL_MAT_TQ;
++    result->src[0] = kq;
++    result->src[1] = v;
++
++    return result;
++}
++
+ // ggml_out_prod
+ 
+ static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
+diff --git a/include/llama.h b/include/llama.h
+index 1805ed0..05d560c 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -395,6 +395,16 @@ extern "C" {
+         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
+         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+ 
++        // [CPU-SPEC][EXPERIMENTAL] adaptive flash attention (used only with flash_attn_type == AUTO)
++        //   on CPU, the flash attention kernel degrades much faster with context length than the
++        //   legacy path does. with these, the attention path is chosen per decode step:
++        //     n_kv <= fa_kv_threshold  -> flash attention
++        //     n_kv >  fa_kv_threshold  -> legacy attention
++        //   the switch is applied only when n_tokens <= fa_max_tokens, so that prefill always
++        //   keeps using flash attention (the legacy path materializes a large f32 KQ matrix).
++        int32_t fa_kv_threshold; // 0 = disabled (i.e. always use flash attention)
++        int32_t fa_max_tokens;   // 0 = disabled
++
+         // Abort callback
+         // if it returns true, execution of llama_decode() will be aborted
+         // currently works only with CPU execution
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8675f60..59d3da1 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -230,6 +230,26 @@ llama_context::llama_context(
+     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
+     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
+ 
++    // [CPU-SPEC] adaptive flash attention.
++    //   note: the V cache layout is decided once, when the KV cache is created
++    //   (v_trans = !cparams.flash_attn). flipping the attention path at runtime would
++    //   force a full V transpose on every step for the "wrong" path
++    //   (see build_attn_mha(): "note: avoid this branch"), which costs more than it saves.
++    //   so the decision is made statically below, right after n_ctx is known.
++    //   per-step switching stays available behind LLAMA_FA_DYNAMIC=1 for experiments.
++    cparams.fa_kv_threshold = params.fa_kv_threshold;
++    cparams.fa_max_tokens   = params.fa_max_tokens;
++    cparams.fa_adaptive     = false;
++
++    {
++        const char * env = getenv("LLAMA_FA_DYNAMIC");
++        if (env && atoi(env) != 0 && params.fa_kv_threshold > 0) {
++            cparams.fa_adaptive = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
++            LLAMA_LOG_WARN("%s: [CPU-SPEC] experimental per-step flash attention switching enabled "
++                           "(expect a V transpose penalty on one of the two paths)\n", __func__);
++        }
++    }
++
+     cparams.fused_gdn_ar = true;
+     cparams.fused_gdn_ch = true;
+     cparams.auto_fgdn    = false;
+@@ -304,6 +324,21 @@ llama_context::llama_context(
+         }
+     }
+ 
++    // [CPU-SPEC] with `-fa auto`, pick the attention path using the requested context size
++    //   instead of only asking the backend whether it supports flash attention.
++    //   measured on Qwen3-0.6B Q2_K / Core Ultra 7 155H (t=12), legacy vs FA:
++    //     ctx 64: -11% | ctx 512: -12% | ctx 1024: -3% | ctx 2048: +13% | ctx 4096: +44% | ctx 8192: +91%
++    //   this has to happen before the KV cache is created (it fixes the V layout).
++    if (cparams.auto_fa && !cparams.fa_adaptive && params.fa_kv_threshold > 0 &&
++        cparams.n_ctx > (uint32_t) params.fa_kv_threshold) {
++        cparams.flash_attn = false;
++        cparams.auto_fa    = false;
++
++        LLAMA_LOG_INFO("%s: [CPU-SPEC] n_ctx (%u) > fa_kv_threshold (%d) - using legacy attention "
++                       "(faster than flash attention at this context size on CPU)\n",
++                __func__, cparams.n_ctx, params.fa_kv_threshold);
++    }
++
+     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
+     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
+     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
+@@ -461,10 +496,11 @@ llama_context::llama_context(
+ 
+         sched_reserve();
+ 
+-        if (!cparams.flash_attn) {
+-            if (ggml_is_quantized(params.type_v)) {
+-                throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+-            }
++        // [CPU-SPEC] Spec 03: see the note at the other call site above. The former
++        //   LLAMA_QV_LEGACY escape hatch is gone - it produced mis-addressed garbage, so it was
++        //   a footgun rather than a fallback. This is its replacement.
++        if (!cparams.flash_attn && !llama_qv_op_enabled() && ggml_is_quantized(params.type_v)) {
++            throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
+         }
+     }
+ 
+@@ -3721,6 +3757,8 @@ llama_context_params llama_context_default_params() {
+         /*.cb_eval_user_data           =*/ nullptr,
+         /*.type_k                      =*/ GGML_TYPE_F16,
+         /*.type_v                      =*/ GGML_TYPE_F16,
++        /*.fa_kv_threshold             =*/ 2048,
++        /*.fa_max_tokens               =*/ 1,
+         /*.abort_callback              =*/ nullptr,
+         /*.abort_callback_data         =*/ nullptr,
+         /*.embeddings                  =*/ false,
+@@ -3779,7 +3817,14 @@ llama_context * llama_init_from_model(
+         return nullptr;
+     }
+ 
+-    if (ggml_is_quantized(params.type_v) && params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_ENABLED) {
++    // [CPU-SPEC] Spec 03: upstream forces flash attention whenever the V cache is quantized.
++    //   The reason was real - the legacy V layout (token innermost, element stride 1) cannot be
++    //   addressed by a block-quantized type, and letting it through silently produced garbage
++    //   (benchmark_results.md §11.3). Spec 03 removes the reason instead of the guard: with the
++    //   op enabled, V is stored in the flash-attn layout (llama-model.cpp attn_v_trans) and the
++    //   legacy graph consumes it through ggml_mul_mat_tq, so the restriction is lifted.
++    //   LLAMA_QV_OP=0 keeps upstream behaviour for A/B and bisect.
++    if (!llama_qv_op_enabled() && ggml_is_quantized(params.type_v)) {
+         if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO) {
+             LLAMA_LOG_INFO("%s: enabling flash_attn since it is required for quantized V cache\n", __func__);
+             params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index b592de1..ea4524a 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -2,6 +2,8 @@
+ 
+ #include "llama.h"
+ 
++#include <cstdlib>
++#include <cstring>
+ #include <cstdint>
+ #include <vector>
+ 
+@@ -39,6 +41,14 @@ struct llama_cparams {
+     bool offload_kqv;
+     bool flash_attn;
+     bool auto_fa;
++
++    // [CPU-SPEC] adaptive flash attention: choose the attention path per decode step
++    //   based on the current KV length instead of once at context creation.
++    //   motivation: on CPU, the flash attention kernel degrades fast with context
++    //   length, while the legacy path does not. see specs/fa-auto-adaptive.md
++    bool     fa_adaptive      = false;
++    int32_t  fa_kv_threshold  = 1024; // use FA while n_kv <= this, else legacy
++    int32_t  fa_max_tokens    = 1;    // only switch away from FA when n_tokens <= this (prefill stays on FA)
+     bool fused_gdn_ar;       // use fused gated delta net (autoregressive)
+     bool fused_gdn_ch;       // use fused gated delta net (chunked)
+     bool auto_fgdn;
+@@ -65,3 +75,73 @@ struct llama_cparams {
+ 
+     llama_context * ctx_other;
+ };
++
++// [CPU-SPEC] single source of truth for "should this graph use flash attention?".
++//   n_kv     - number of KV entries participating in attention (context length)
++//   n_tokens - number of query tokens in the current ubatch (1 == pure decode)
++// keep in sync with the mask type chosen in llama-graph.cpp, otherwise the graph
++// would be built with an f16 mask but a legacy (f32 mask) attention path, or vice versa.
++static inline bool llama_fa_enabled(const llama_cparams & cparams, int64_t n_kv, int64_t n_tokens) {
++    if (!cparams.flash_attn) {
++        return false; // explicitly disabled
++    }
++
++    if (!cparams.fa_adaptive) {
++        return true; // explicitly enabled, or not in adaptive mode
++    }
++
++    // never switch to the legacy path during prefill: it materializes the full
++    // [n_kv, n_tokens] KQ matrix in f32, which blows up the compute buffer
++    if (n_tokens > cparams.fa_max_tokens) {
++        return true;
++    }
++
++    return n_kv <= cparams.fa_kv_threshold;
++}
++
++// [CPU-SPEC] Spec 03 §6: single source of truth for "may the legacy attention path consume a
++//   quantized V cache through the MUL_MAT_TQ op?".
++//
++//   Upstream forbids a quantized V cache without flash attention, and §15.2 confirms the reason
++//   is real: the legacy layout exposes V with the token index innermost, and a block-quantized V
++//   fed to mul_mat that way produces garbage. Spec 03 removes the reason by storing V in the
++//   flash-attn layout and transposing the loop inside a new op instead.
++//
++//   Default is OFF. The op is correct (§15.1) but it does not pay for itself: at ctx 8192 it
++//   reaches 17.2 t/s against 25.5 t/s for the plain "quantized K + f16 V" configuration it was
++//   meant to beat, so Spec 03's own gate G3 fails and the switch stays off until the kernel is
++//   reworked. LLAMA_QV_OP=1 turns it on; all three call sites must read this one helper, or the
++//   graph and the cache layout will disagree.
++static inline bool llama_qv_op_enabled() {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_QV_OP");
++        return env && atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++// [CPU-SPEC] debugging aids. All off by default; they exist so the two findings in §15 can be
++//   re-derived from the checked-out tree instead of taken on faith.
++//
++//   LLAMA_QV_LEGACY_LAYOUT=1: keep the upstream (token-innermost) V layout even when V is
++//     quantized, so the legacy graph consumes it through plain ggml_mul_mat. Measured at
++//     32.8 t/s - exactly the roofline the op was chasing - but the output is garbage (§15.2).
++//     This is the number that makes the temptation concrete, so it is worth keeping reproducible.
++//   LLAMA_QV_FORCE=1: route an f16 V through the TQ op as well. Nothing is dequantized then, so
++//     TQ and upstream mul_mat move the same bytes and compute the same value - the gap that
++//     remains is the kernel's own structure (§15.3: it is ~2x slower than mul_mat).
++static inline bool llama_qv_legacy_layout() {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_QV_LEGACY_LAYOUT");
++        return env && atoi(env) != 0;
++    }();
++    return enabled;
++}
++
++static inline bool llama_qv_force_layout() {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_QV_FORCE");
++        return env && atoi(env) != 0;
++    }();
++    return enabled;
++}
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 0b3bab6..a4f503e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -36,7 +36,8 @@ static ggml_tensor * build_attn_inp_kq_mask(
+     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+ 
+     // flash attention requires an f16 mask
+-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
++    // [CPU-SPEC] the choice is per-step when adaptive FA is on
++    const auto type = llama_fa_enabled(cparams, n_kv, n_tokens) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ 
+     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+     ggml_set_input(res);
+@@ -61,6 +62,10 @@ static bool can_reuse_kq_mask(
+     res &= (kq_mask->ne[2] == 1);
+     res &= (kq_mask->ne[3] == n_stream);
+ 
++    // [CPU-SPEC] with adaptive FA the mask type can flip across the KV threshold,
++    //   which changes the graph topology. the shape check above is not enough.
++    res &= (kq_mask->type == (llama_fa_enabled(cparams, n_kv, n_tokens) ? GGML_TYPE_F16 : GGML_TYPE_F32));
++
+     return res;
+ }
+ 
+@@ -813,7 +818,7 @@ static ggml_tensor * dsv4_build_raw_kq_mask(
+     GGML_ASSERT(n_stream > 0);
+     GGML_ASSERT(n_tokens%n_stream == 0);
+ 
+-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
++    const auto type = llama_fa_enabled(cparams, n_kv, n_tokens) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ 
+     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
+     ggml_set_input(res);
+@@ -974,7 +979,7 @@ static void dsv4_build_comp_inputs(
+         GGML_ASSERT(n_stream > 0);
+         GGML_ASSERT(n_tokens%n_stream == 0);
+ 
+-        inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && cparams.flash_attn) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
++        inp.kq_mask = ggml_new_tensor_4d(ctx, (strcmp(name, "lid") != 0 && llama_fa_enabled(cparams, plan.n_kv, n_tokens)) || (strcmp(name, "lid") == 0 && cparams.fused_lid) ? GGML_TYPE_F16 : GGML_TYPE_F32, plan.n_kv, n_tokens/n_stream, 1, n_stream);
+         ggml_set_input(inp.kq_mask);
+         ggml_set_name(inp.kq_mask, (std::string("dsv4_") + name + "_kq_mask").c_str());
+     }
+@@ -2632,7 +2637,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+     ggml_tensor * cur;
+ 
+-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
++    // [CPU-SPEC] adaptive flash attention: on CPU the FA kernel degrades much faster
++    //   with context length than the legacy path does, so pick per-step. see specs/fa-auto-adaptive.md
++    const int64_t n_kv_cur = kq_mask ? kq_mask->ne[0] : n_kv_max;
++
++    const bool use_flash_attn = llama_fa_enabled(cparams, n_kv_cur, n_tokens) && kq_b == nullptr;
+     if (use_flash_attn) {
+         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
+ 
+@@ -2715,13 +2724,32 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         ggml_soft_max_add_sinks(kq, sinks);
+         cb(kq, "kq_soft_max", il);
+ 
++        ggml_tensor * kqv;
++
+         if (!v_trans) {
+-            // note: avoid this branch
+-            v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
+-            cb(v, "v_cont", il);
++            // [CPU-SPEC] Spec 03: v is in the flash-attn layout here ([D, T, Hkv, n_stream]).
++            //   Materializing the transpose below is the "note: avoid this branch" path - at
++            //   ctx 8192 it moves ~940 MiB per token (benchmark_results.md §12). So when the
++            //   data can be consumed as-is we transpose the loop instead of the tensor.
++            //   kq, kq_b, sinks and soft-capping all act before soft_max_ext above, so the op
++            //   sees a plain post-softmax kq and needs no guards for any of them.
++            const bool use_tq = llama_qv_op_enabled() &&
++                                v->type != GGML_TYPE_F32 &&
++                                k->ne[3] == 1 &&
++                                !v_mla;
++
++            if (use_tq) {
++                kqv = ggml_mul_mat_tq(ctx0, kq, v);
++                cb(kqv, "kqv_tq", il);
++            } else {
++                // note: avoid this branch - kept for f32 V, multi-stream and MLA configs
++                v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
++                cb(v, "v_cont", il);
++                kqv = ggml_mul_mat(ctx0, v, kq);
++            }
++        } else {
++            kqv = ggml_mul_mat(ctx0, v, kq);
+         }
+-
+-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
+         cb(kqv, "kqv", il);
+ 
+         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
+@@ -2750,7 +2778,8 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
+     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
+ 
+     // flash attention requires an f16 mask
+-    const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
++    // [CPU-SPEC] keep the mask type in sync with the attention path chosen in build_attn_mha()
++    const auto type_mask = llama_fa_enabled(cparams, n_tokens, n_tokens) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ 
+     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
+     inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
+@@ -3255,7 +3284,8 @@ llm_graph_input_attn_cross * llm_graph_context::build_attn_inp_cross() const {
+     const int32_t n_enc = !cross->v_embd.empty() ? cross->n_enc : hparams.n_ctx_train;
+ 
+     // flash attention requires an f16 mask
+-    const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
++    // [CPU-SPEC] keep the mask type in sync with the attention path chosen in build_attn_mha()
++    const auto type_mask = llama_fa_enabled(cparams, n_enc, n_tokens) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+ 
+     inp->cross_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_enc, n_tokens, 1, 1);
+     ggml_set_input(inp->cross_kq_mask);
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index ab5e744..6a5c0a8 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2341,6 +2341,19 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
+ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
+     llama_memory_i * res;
+ 
++    // [CPU-SPEC] Spec 03: v_trans decides the *storage layout* of the V cache.
++    //   Upstream: legacy attention -> transposed (token innermost), FA -> not.
++    //   A block-quantized V can only be consumed in one of two ways: either by the flash-attn
++    //   kernel, or by ggml_mul_mat_tq, which transposes the *loop* instead of the data
++    //   (llama-graph.cpp:2729). Both want the non-transposed layout, so whenever Spec 03 is
++    //   enabled and V is quantized we store it non-transposed even on the legacy path.
++    //   NOTE: must be evaluated after every flash_attn decision is final, including the
++    //   adaptive flip in llama-context.cpp - which is why it lives here, at the single point
++    //   where all KV caches in this function are constructed.
++    const bool attn_v_trans = !cparams.flash_attn &&
++        (llama_qv_legacy_layout() ||
++         !(llama_qv_op_enabled() && (ggml_is_quantized(params.type_v) || llama_qv_force_layout())));
++
+     switch (arch) {
+         // Models that need specific instantiation should be handled in the
+         // switch statement
+@@ -2371,7 +2384,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                         *this,
+                         params.type_k,
+                         params.type_v,
+-                        !cparams.flash_attn,
++                        attn_v_trans,
+                         cparams.offload_kqv,
+                         cparams.kv_unified,
+                         cparams.n_ctx_seq,
+@@ -2398,7 +2411,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             hparams,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             cparams.kv_unified,
+                             cparams.n_ctx_seq,
+@@ -2423,7 +2436,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             *this,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             cparams.kv_unified,
+                             cparams.n_ctx_seq,
+@@ -2445,7 +2458,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             hparams,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             cparams.kv_unified,
+                             cparams.n_ctx_seq,
+@@ -2465,7 +2478,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             *this,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             cparams.kv_unified,
+                             cparams.n_ctx_seq,
+@@ -2492,7 +2505,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             hparams,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             cparams.kv_unified,
+                             cparams.n_ctx_seq,
+@@ -2516,7 +2529,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             *this,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             params.swa_full,
+                             cparams.kv_unified,
+@@ -2542,7 +2555,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             *this,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             params.swa_full,
+                             cparams.kv_unified,
+@@ -2559,7 +2572,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             *this,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             params.swa_full,
+                             cparams.kv_unified,
+@@ -2582,7 +2595,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             *this,
+                             params.type_k,
+                             params.type_v,
+-                            !cparams.flash_attn,
++                            attn_v_trans,
+                             cparams.offload_kqv,
+                             params.swa_full,
+                             cparams.kv_unified,
+@@ -2662,7 +2675,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* model             */ *this,
+                             /* attn_type_k       */ params.type_k,
+                             /* attn_type_v       */ params.type_v,
+-                            /* attn_v_trans      */ !cparams.flash_attn,
++                            /* attn_v_trans      */ attn_v_trans,
+                             /* attn_swa_full     */ params.swa_full,
+                             /* attn_kv_size      */ cparams.n_ctx_seq,
+                             /* attn_n_ubatch     */ cparams.n_ubatch,
+@@ -2682,7 +2695,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* model             */ *this,
+                             /* attn_type_k       */ params.type_k,
+                             /* attn_type_v       */ params.type_v,
+-                            /* attn_v_trans      */ !cparams.flash_attn,
++                            /* attn_v_trans      */ attn_v_trans,
+                             /* attn_kv_size      */ cparams.n_ctx_seq,
+                             /* attn_n_pad        */ 1,
+                             /* attn_n_swa        */ hparams.n_swa,
+@@ -2702,7 +2715,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* model             */ *this,
+                             /* attn_type_k       */ params.type_k,
+                             /* attn_type_v       */ params.type_v,
+-                            /* attn_v_trans      */ !cparams.flash_attn,
++                            /* attn_v_trans      */ attn_v_trans,
+                             /* attn_kv_size      */ cparams.n_ctx_seq,
+                             /* attn_n_pad        */ 1,
+                             /* attn_n_swa        */ hparams.n_swa,
+@@ -2768,7 +2781,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                                     *this,
+                                     params.type_k,
+                                     params.type_v,
+-                                    !cparams.flash_attn,
++                                    attn_v_trans,
+                                     cparams.offload_kqv,
+                                     params.swa_full,
+                                     cparams.kv_unified,
+@@ -2785,7 +2798,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                                     *this,
+                                     params.type_k,
+                                     params.type_v,
+-                                    !cparams.flash_attn,
++                                    attn_v_trans,
+                                     cparams.offload_kqv,
+                                     params.swa_full,
+                                     cparams.kv_unified,
+@@ -2806,7 +2819,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                                 hparams,
+                                 params.type_k,
+                                 params.type_v,
+-                                !cparams.flash_attn,
++                                attn_v_trans,
+                                 cparams.offload_kqv,
+                                 cparams.kv_unified,
+                                 cparams.n_ctx_seq,
+diff --git a/tools/tts/tts.cpp b/tools/tts/tts.cpp
+index 6fd1936..f254574 100644
+--- a/tools/tts/tts.cpp
++++ b/tools/tts/tts.cpp
+@@ -9,6 +9,8 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <string>
++#include <iostream>
++#include <vector>
+ 
+ /**
+  * Please note that this is NOT a production-ready binary.
+@@ -53,9 +55,25 @@ int main(int argc, char ** argv) {
+ 
+     mtmd_helper_log_set(common_log_default_callback, nullptr);
+ 
+-    if (params.prompt.empty()) {
+-        LOG_ERR("no prompt provided, use -p \"text\"\n");
+-        return 1;
++    // loop mode: read one prompt per line from stdin and generate all of them inside
++    // the SAME process. this is what separates per-process overhead (model load,
++    // first-call graph build / warmup) from per-call cost.
++    // enabled with LLAMA_TTS_LOOP=1
++    const bool   loop_mode = getenv("LLAMA_TTS_LOOP") != nullptr;
++    std::vector<std::string> prompts;
++    if (loop_mode) {
++        // Interactive request/response protocol: read one line, generate it,
++        // print `[i] wrote <path>`, then read the next line. Draining stdin to
++        // EOF up front would deadlock a caller that keeps the pipe open (which
++        // is exactly what a resident TTS service does).
++        LOG_INF("loop mode: reading prompts from stdin, one per line\n");
++        fflush(stdout);
++    } else {
++        if (params.prompt.empty()) {
++            LOG_ERR("no prompt provided, use -p \"text\"\n");
++            return 1;
++        }
++        prompts.push_back(params.prompt);
+     }
+     if (params.mmproj.path.empty()) {
+         LOG_ERR("no mmproj provided, use --mmproj\n");
+@@ -87,6 +105,10 @@ int main(int argc, char ** argv) {
+     mtmd_context_params mtmd_params = mtmd_context_params_default();
+     mtmd_params.use_gpu = params.mmproj_use_gpu;
+     mtmd_params.device  = params.mmproj_device;
++    // code2wav (the vocoder) runs inside mmproj and defaults to 4 threads only.
++    // -t N must reach it, otherwise the vocoder stays single-handedly slow no
++    // matter how many threads the backbone gets.
++    mtmd_params.n_threads = params.cpuparams.n_threads;
+     mtmd::context_ptr mctx(mtmd_init_from_file(params.mmproj.path.c_str(), model, mtmd_params));
+     if (!mctx) {
+         LOG_ERR("failed to load mmproj %s\n", params.mmproj.path.c_str());
+@@ -111,28 +133,68 @@ int main(int argc, char ** argv) {
+         speaker_bitmap.reset(wrapper.bitmap);
+     }
+ 
++    // one pipeline instance for the whole session: anything cached on the instance
++    // (specials lookup, code2wav graph) is kept alive across iterations
+     mtmd_helper::gen_audio gen(lctx, mctx.get());
+-    mtmd_helper_gen_audio_inp inp{};
+-    inp.seq_id      = 0;
+-    inp.prompt      = params.prompt.c_str();
+-    inp.prompt_len  = params.prompt.size();
+-    inp.speaker_ref = speaker_bitmap.get();
+-    inp.lang        = params.tts_lang.c_str();
+-    inp.top_k       = params.sampling.top_k;
+-    inp.top_p       = params.sampling.top_p;
+-    inp.seed        = params.sampling.seed;
+-    inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
+-
+-    //
+-    // stage 1: process prompt via backbone model, generate semantic representation
+-    //
+ 
+-    if (gen.set_input(&inp) != 0) {
+-        LOG_ERR("set_input failed\n");
+-        return 1;
++    const bool multi = loop_mode || prompts.size() > 1;
++    std::string stem = params.out_file;
++    std::string ext;
++    {
++        size_t dot = stem.find_last_of('.');
++        if (dot != std::string::npos) {
++            ext  = stem.substr(dot);
++            stem = stem.substr(0, dot);
++        }
+     }
+ 
+-    const int64_t t_prompt_start_us = ggml_time_us();
++    size_t iter = 0;
++    while (true) {
++        std::string text;
++        if (loop_mode) {
++            if (!std::getline(std::cin, text)) {
++                break;  // stdin closed: caller is done, exit cleanly
++            }
++            if (!text.empty() && text.back() == '\r') {
++                text.pop_back();
++            }
++            if (text.empty()) {
++                continue;
++            }
++        } else {
++            if (iter >= prompts.size()) {
++                break;
++            }
++            text = prompts[iter];
++        }
++
++        // backbone KV cache and sampler keep state from the previous run
++        llama_memory_clear(llama_get_memory(lctx), true);
++        common_sampler_reset(smpl);
++
++        mtmd_helper_gen_audio_inp inp{};
++        inp.seq_id      = 0;
++        inp.prompt      = text.c_str();
++        inp.prompt_len  = text.size();
++        inp.speaker_ref = speaker_bitmap.get();
++        inp.lang        = params.tts_lang.c_str();
++        inp.top_k       = params.sampling.top_k;
++        inp.top_p       = params.sampling.top_p;
++        inp.seed        = params.sampling.seed;
++        inp.out_type    = MTMD_HELPER_GEN_AUDIO_OUTTYPE_WAV;
++
++        const int64_t t_iter_start_us = ggml_time_us();
++
++        //
++        // stage 1: process prompt via backbone model, generate semantic representation
++        //
++
++        if (gen.set_input(&inp) != 0) {
++            LOG_ERR("set_input failed\n");
++            return 1;
++        }
++
++        const int64_t t_prompt_start_us = ggml_time_us();
+ 
+     for (;;) {
+         int32_t ret = gen.step_prompt(params.n_batch);
+@@ -179,35 +241,45 @@ int main(int argc, char ** argv) {
+         sampled = sample_semantic_code();
+         timings.report(n_frames);
+     }
+-    const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
+-
+-    int32_t      sample_rate = 0;
+-    const char * data        = nullptr;
+-    size_t       data_len    = 0;
+-    int64_t      n_samples   = 0;
+-    const int64_t t_wav_start_us = ggml_time_us();
+-    if (gen.get_output(&sample_rate, &data, &data_len, &n_samples) != 0) {
+-        LOG_ERR("get_output failed\n");
+-        return 1;
+-    }
+-    const double t_wav_s = (ggml_time_us() - t_wav_start_us) / 1e6;
+-
+-    LOG_INF("generated %d frames, %zu bytes of WAV audio (%d Hz)\n", n_frames, data_len, sample_rate);
+-
+-    const double t_prompt_s = (t_gen_start_us - t_prompt_start_us) / 1e6;
+-    const double t_total_s  = t_prompt_s + t_gen_s + t_wav_s;
+-    const double audio_s    = sample_rate > 0 ? (double) n_samples / sample_rate : 0.0;
+-    LOG_INF("timings: prompt eval %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs\n",
+-            t_prompt_s, t_gen_s, t_wav_s, t_total_s);
+-    LOG_INF("         output audio = %.2fs (audio time = %.2fx process time)\n", audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
+-    FILE * f = fopen(params.out_file.c_str(), "wb");
+-    if (!f) {
+-        LOG_ERR("failed to open %s\n", params.out_file.c_str());
+-        return 1;
++        const double t_gen_s = (ggml_time_us() - t_gen_start_us) / 1e6;
++
++        int32_t      sample_rate = 0;
++        const char * data        = nullptr;
++        size_t       data_len    = 0;
++        int64_t      n_samples   = 0;
++        const int64_t t_wav_start_us = ggml_time_us();
++        if (gen.get_output(&sample_rate, &data, &data_len, &n_samples) != 0) {
++            LOG_ERR("get_output failed\n");
++            return 1;
++        }
++        const double t_wav_s = (ggml_time_us() - t_wav_start_us) / 1e6;
++
++        const double t_prompt_s = (t_gen_start_us - t_prompt_start_us) / 1e6;
++        const double t_total_s  = t_prompt_s + t_gen_s + t_wav_s;
++        const double t_iter_s   = (ggml_time_us() - t_iter_start_us) / 1e6;
++        const double audio_s    = sample_rate > 0 ? (double) n_samples / sample_rate : 0.0;
++
++        std::string out_path = multi ? stem + "_" + std::to_string(iter) + ext
++                                     : params.out_file;
++        FILE * f = fopen(out_path.c_str(), "wb");
++        if (!f) {
++            LOG_ERR("failed to open %s\n", out_path.c_str());
++            return 1;
++        }
++        fwrite(data, 1, data_len, f);
++        fclose(f);
++
++        LOG_INF("[%d] generated %d frames, %zu bytes of WAV audio (%d Hz)\n",
++                (int) iter, n_frames, data_len, sample_rate);
++        LOG_INF("[%d] timings: prompt %.2fs + generation %.2fs + vocoder %.2fs = total %.2fs (wall %.2fs)\n",
++                (int) iter, t_prompt_s, t_gen_s, t_wav_s, t_total_s, t_iter_s);
++        LOG_INF("[%d]          audio = %.2fs (audio time = %.2fx process time)\n",
++                (int) iter, audio_s, t_total_s > 0 ? audio_s / t_total_s : 0.0);
++        LOG_INF("[%d] wrote %s\n", (int) iter, out_path.c_str());
++        fflush(stdout);
++        fflush(stderr);
++        iter++;
+     }
+-    fwrite(data, 1, data_len, f);
+-    fclose(f);
+-    LOG_INF("wrote %s\n", params.out_file.c_str());
+ 
+     llama_backend_free();
+     return 0;

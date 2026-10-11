@@ -1,0 +1,52 @@
+# Local edge deployment snippet for Open-LLM-VTuber v1.2.1
+#
+# Two things are wired to our own llama.cpp build:
+#   1. LLM  -> llama-server's OpenAI-compatible endpoint (no llama-cpp-python needed)
+#   2. TTS  -> Qwen3-TTS via llama-tts (resident process, see src/.../tts/qwen3_tts.py)
+#
+# Start the LLM server first, on the port below:
+#   llama.cpp/build/bin/llama-server.exe ^
+#     -m <PROJECT_ROOT>/models/Qwen3-0.6B-q5_0.gguf ^
+#     -c 4096 -t 12 --host 127.0.0.1 --port 8099
+#
+# Measured on Ultra 7 155H: 53 tok/s decode, 99 tok/s prompt.
+# WARNING: Qwen3 emits `reasoning_content` (thinking) by default, so `content`
+# can come back empty for short max_tokens. Disable thinking in the character
+# prompt / chat template, or raise max_tokens, before blaming the pipeline.
+
+  llm_configs:
+    # was: ollama_llm / llama_cpp_llm
+    openai_compatible_llm:
+      base_url: 'http://127.0.0.1:8099/v1'
+      llm_api_key: 'not-needed'
+      organization_id: null
+      project_id: null
+      model: 'Qwen3-0.6B-q5_0'      # llama-server ignores this, any string works
+      temperature: 0.8
+      interrupt_method: 'user'
+
+  tts_config:
+    tts_model: 'qwen3_tts'          # new engine, registered in tts/tts_factory.py
+    # Faster-first-response is what hides the residual TTS latency: the first
+    # sentence is spoken while the rest is still being generated.
+    faster_first_response: True
+    segment_method: 'pysbd'
+    #
+    # measured per-utterance cost (Ultra 7 155H, 12 threads, mmproj q8_0):
+    #   ~3.0 s  vocoder -- a FIXED cost, paid once per utterance, independent of
+    #           how long the sentence is (code2wav always decodes a 72-frame
+    #           window, zero-padded). Residency does NOT amortise it.
+    #   ~0.07 s per frame of generation
+    #   ~1.2 s of audio -> ~4.0 s total ; 3.1 s of audio -> ~6.0 s total
+    #
+    # consequence: say fewer, longer sentences. The fixed tax dominates short ones.
+    qwen3_tts:
+      llama_tts_bin: '<PROJECT_ROOT>/llama.cpp/build/bin/llama-tts.exe'
+      backbone_model: '<PROJECT_ROOT>/models/Qwen3-TTS-0.6B-q8_0.gguf'
+      mmproj_model: '<PROJECT_ROOT>/models/mmproj-Qwen3-TTS-0.6B-q8_0.gguf'
+      lang: 'zh'
+      threads: 12                   # 22 threads measured slightly WORSE; 12 is the sweet spot
+      speaker_file: ''              # optional reference wav for voice cloning
+      max_new_tokens: 0             # 0 = model default cap (512)
+      tmp_dir: 'cache/qwen3_tts'
+      keep_resident: True           # saves ~3.4 s of model load per utterance
