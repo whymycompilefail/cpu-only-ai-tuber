@@ -189,9 +189,12 @@ llama-server 启动即崩。
 
 ## 已知缺口
 
-- 脚本的 Windows 假设（见上）
-- **`ctest/make_release.py` 的白名单是照"不含 llama.cpp"那个时期的边界写的**，还没更新
-- 部分历史 benchmark 输出快照已从仓库剔除（它们印着本机绝对路径），保留在本地工作区
+- 脚本的 Windows 假设（见上）——只在一台机器、一种 shell（Git Bash）下验证过
+- 部分历史 benchmark 输出快照已从仓库剔除（它们印着本机绝对路径），保留在本地工作区，
+  文中引用的数字以 `ctest/benchmark_results.md` 的文字结论为准
+- 隐私扫描的 pre-commit hook **不会随 git 推送**（git 不传播 hook），贡献者需自行执行
+  `ctest/install_hooks.sh`；单人使用时注意 `scrub_scan.py --git-staged` 在 commit 之后
+  会静默跳过（index 无差异）这个陷阱
 
 ---
 
