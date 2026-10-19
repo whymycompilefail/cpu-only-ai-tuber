@@ -1125,7 +1125,15 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 const auto  gen_process = params ? params->gen_process : CLIP_GEN_PROCESS_GEN_CODE;
                 const int   top_k = params ? params->top_k : 50;
                 const float top_p = params ? params->top_p : 1.0f;
-                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p);
+                // GEN_WAV: the graph is built for the real frame count, so a short tail
+                // window does not pay for the full attention window
+                int n_frames = ctx->model.hparams.wav_tfm_swa;
+                if (params && params->gen_process == CLIP_GEN_PROCESS_GEN_WAV && params->codes != nullptr) {
+                    const int64_t n_codes = ctx->model.gen_code_head_w->ne[2] + 1;
+                    n_frames = (int) (params->codes->size() / n_codes);
+                    n_frames = std::max(1, std::min(n_frames, (int) ctx->model.hparams.wav_tfm_swa));
+                }
+                builder = std::make_unique<clip_graph_qwen3tts_gen>(ctx, img, gen_process, top_k, top_p, n_frames);
             } break;
         case PROJECTOR_TYPE_YOUTUVL:
             {
@@ -5305,7 +5313,8 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 if (params->gen_process == CLIP_GEN_PROCESS_GEN_WAV) {
                     GGML_ASSERT(params->codes != nullptr);
 
-                    // frame-major input to group-major, rear-padded with code 0 up to one window
+                    // frame-major input to group-major; the graph is built for exactly
+                    // n_frames, so the tail window needs no code-0 padding at all
                     const int64_t n_codes  = model.gen_code_head_w->ne[2] + 1;
                     const int64_t n_frames_w = hparams.wav_tfm_swa;
                     const int64_t n_frames   = (int64_t) params->codes->size() / n_codes;
@@ -5326,10 +5335,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                         }
                     }
 
-                    std::vector<int32_t> codes(n_frames_w * n_codes, 0);
+                    std::vector<int32_t> codes(n_frames * n_codes, 0);
                     for (int64_t f = 0; f < n_frames; f++) {
                         for (int64_t g = 0; g < n_codes; g++) {
-                            codes[g * n_frames_w + f] = (*params->codes)[f * n_codes + g];
+                            codes[g * n_frames + f] = (*params->codes)[f * n_codes + g];
                         }
                     }
                     set_input_i32("inp_codes", codes);
@@ -5853,15 +5862,6 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         auto & out_audio = *params->out_audio;
         out_audio.resize(ggml_nelements(audio));
         ggml_backend_tensor_get(audio, out_audio.data(), 0, ggml_nbytes(audio));
-
-        // drop the tail audio that comes from the code-0 rear padding
-        const int64_t n_codes    = params->codes ? model.gen_code_head_w->ne[2] + 1 : 0;
-        const int64_t n_frames_w = hparams.wav_tfm_swa;
-        const int64_t n_frames   = params->codes ? (int64_t) params->codes->size() / n_codes : n_frames_w;
-        if (n_frames < n_frames_w) {
-            const size_t hop = out_audio.size() / n_frames_w;
-            out_audio.resize((size_t) n_frames * hop);
-        }
     }
     if (params->state_out != nullptr) {
         auto & state_out = *params->state_out;

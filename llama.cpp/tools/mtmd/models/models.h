@@ -248,8 +248,8 @@ struct clip_graph_qwen3tts_spkenc : clip_graph {
 };
 
 struct clip_graph_qwen3tts_gen : clip_graph {
-    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p)
-        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p) {}
+    clip_graph_qwen3tts_gen(clip_ctx * ctx, const clip_image_f32 & img, clip_gen_process_type gen_process, int top_k, float top_p, int n_frames)
+        : clip_graph(ctx, img), gen_process(gen_process), top_k(top_k), top_p(top_p), n_frames(n_frames) {}
     ggml_cgraph * build() override;
 
     // which sub-graph build() constructs, fixed at graph-build time
@@ -258,6 +258,10 @@ struct clip_graph_qwen3tts_gen : clip_graph {
     // sampling params, fixed at graph-build time (GEN_CODE only)
     int   top_k;
     float top_p;
+
+    // real frame count of this call (GEN_WAV only): the tail window may be shorter
+    // than the attention window, so only the frames that are actually needed get computed
+    int   n_frames;
 
     //
     // code_gen: backbone hidden state + sampled code0 -> 16 RVQ codes
