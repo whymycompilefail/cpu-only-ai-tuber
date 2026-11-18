@@ -3,8 +3,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root, derived f
 # A/B: does the vocoder (which lives in mmproj) respond to threads and to quantisation?
 # backbone is fixed at q8_0; the 5-prompt loop gives steady-state numbers (iter 0 is warmup).
 set -u
-LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
-[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../cpu-afterburner/llama.cpp}"   # 唯一真源：cpu-afterburner 仓内
+[ -d "$LLAMA_DIR/build/bin" ] || { echo "no llama build at $LLAMA_DIR/build/bin -- run ctest/build_llama.bat" >&2; exit 1; }
 LL=$LLAMA_DIR/build/bin/llama-tts.exe
 M=$ROOT/models
 IN=$ROOT/ctest/tts_loop_in.txt

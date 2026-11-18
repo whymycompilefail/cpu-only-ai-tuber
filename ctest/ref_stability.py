@@ -2,7 +2,9 @@ import os, subprocess, warnings
 warnings.filterwarnings("ignore")
 import numpy as np, librosa
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT,"llama.cpp","build","bin","llama-tts.exe")
+LLAMA_DIR = os.environ.get("LLAMA_DIR") or os.path.join(
+    os.path.dirname(ROOT), "cpu-afterburner", "llama.cpp")
+BIN = os.path.join(LLAMA_DIR,"build","bin","llama-tts.exe")
 M  = os.path.join(ROOT,"models","Qwen3-TTS-0.6B-f16.gguf")
 MM = os.path.join(ROOT,"models","mmproj-Qwen3-TTS-0.6B-f16.gguf")
 OUT= os.path.join(ROOT,"ctest","voice_ab","refcand"); os.makedirs(OUT,exist_ok=True)

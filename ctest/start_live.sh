@@ -25,8 +25,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJ="$ROOT/Open-LLM-VTuber"
 LOGDIR="$ROOT/ctest"
 PY="$PROJ/.venv/Scripts/python.exe"
-LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
-[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../cpu-afterburner/llama.cpp}"   # 唯一真源：cpu-afterburner 仓内
+[ -d "$LLAMA_DIR/build/bin" ] || { echo "no llama build at $LLAMA_DIR/build/bin -- run ctest/build_llama.bat" >&2; exit 1; }
 LLAMA="$LLAMA_DIR/build/bin/llama-server.exe"
 MODEL="${STACK_MODEL:-$ROOT/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf}"
 BRIDGE_PORT="${BRIDGE_PORT:-8765}"

@@ -8,8 +8,8 @@
 # usage: bash ctest/eval_model.sh <model.gguf> <label> [port]
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
-[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../cpu-afterburner/llama.cpp}"   # 唯一真源：cpu-afterburner 仓内
+[ -d "$LLAMA_DIR/build/bin" ] || { echo "no llama build at $LLAMA_DIR/build/bin -- run ctest/build_llama.bat" >&2; exit 1; }
 LLAMA="$LLAMA_DIR/build/bin/llama-server.exe"
 # Was a user-profile absolute path (C:/Users/<name>/.workbuddy/...) -- that leaks
 # the Windows account name, and no one cloning this repo has that path anyway.

@@ -104,15 +104,17 @@ llama-server 启动即崩。
 ### llama.cpp 源码不在本仓
 
 CPU 特化构建（`llama-server` / `llama-bench` / `llama-tts`）来自
-[cpu-afterburner](https://github.com/whymycompilefail/cpu-afterburner)：相对上游 `5096f2a`
-的一份 patch（20 文件），不是搬进本仓的 vendor 代码。本仓原先那份 `llama.cpp/` 副本
-已移除——它和那个仓库是同一份改动的两份拷贝，留着只会分叉。
+[cpu-afterburner](https://github.com/whymycompilefail/cpu-afterburner)：源码随那个仓库走
+（`llama.cpp/` 子目录 = 上游 `e351231` + 20 个文件的改动），本仓不再收第二份。
+本仓原先那份 `llama.cpp/` 副本已移除——同一份改动的两份拷贝只会分叉。
 
 脚本统一按下面的顺序找构建产物（`LLAMA_DIR`）：
 
 1. `$LLAMA_DIR`（显式指定）
-2. 本仓同级目录 `../llama-cpp`（默认；几个项目可以共用一份构建）
-3. 本仓内 `llama.cpp/`（旧布局，仅作回退）
+2. 本仓同级 `../cpu-afterburner/llama.cpp`（默认；几个项目共用一份构建）
+
+没有第三项兜底：找不到就直接报错退出。仓内旧布局已经不存在，
+静默回退只会让人误以为跑的是新构建。
 
 > 注意 `ALTERVOX_LLAMA_TTS` 之类的环境变量会被**优先**采纳，比 `LLAMA_DIR` 还靠前。
 > 换过路径却仍然跑到旧构建时，先查环境变量。
@@ -130,7 +132,7 @@ CPU 特化构建（`llama-server` / `llama-bench` / `llama-tts`）来自
 
    ```bash
    git clone https://github.com/whymycompilefail/cpu-afterburner ../cpu-afterburner
-   DEST=../llama-cpp bash ../cpu-afterburner/scripts/setup.sh
+   bash ../cpu-afterburner/scripts/setup.sh   # 构建到 ../cpu-afterburner/llama.cpp/build
    ```
 
    装到本仓同级，上面的查找顺序就能直接命中。Windows 上必须在 MSVC 环境里跑
