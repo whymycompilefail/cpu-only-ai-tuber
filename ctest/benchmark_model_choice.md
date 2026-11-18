@@ -6,6 +6,8 @@
       `ctest/eval_model.sh` + `ctest/eval_multiturn.py`（9 轮带历史）
 所有模型用**同一套 persona + 同一 server 参数**（`--reasoning off --dry-multiplier 0.8
 --repeat-penalty 1.05 -t 12`），走 OpenAI 兼容接口，即真实部署路径。
+编译器同为 **MSVC 14.44.35207 / VS 2022 17.14.24**（2026-11-18 补标）；换工具集后
+tok/s 类数字不可直接对比，但选型结论基于质量与延迟量级，不受影响。
 
 ## 为什么要多轮测试
 
