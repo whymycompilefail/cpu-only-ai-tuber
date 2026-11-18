@@ -30,10 +30,12 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
 
-# Never touch: our own fork's history.
-# .git.fork-backup is the CURRENT name; llama.cpp/.git is kept as a legacy alias
-# in case an old checkout still has it. This set is matched EXACTLY (see the
-# `rel in PROTECTED` check below), so both spellings must be listed.
+# Never touch: fork history. The fork itself left this repo on 2026-11-18
+# (it now lives in cpu-afterburner as a patch; the commit history is in
+# D:\llama.cpp-fork-history.git), so neither path should exist here anymore.
+# Kept as a guard for exactly that reason: if an old checkout still has
+# llama.cpp/, a purge must not eat its .git — that history has no remote.
+# Matched EXACTLY (see `rel in PROTECTED` below), so both spellings are listed.
 PROTECTED = {"llama.cpp/.git.fork-backup", "llama.cpp/.git"}
 
 GIT_DIRS = [
