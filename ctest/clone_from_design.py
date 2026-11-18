@@ -33,7 +33,11 @@ import librosa
 import soundfile as sf
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "llama.cpp", "build", "bin", "llama-tts.exe")
+# llama.cpp 构建位置：LLAMA_DIR > 仓库同级 llama-cpp > 仓库内旧布局
+LLAMA_DIR = os.environ.get("LLAMA_DIR") or os.path.join(os.path.dirname(ROOT), "llama-cpp")
+if not os.path.isdir(os.path.join(LLAMA_DIR, "build", "bin")):
+    LLAMA_DIR = os.path.join(ROOT, "llama.cpp")
+BIN = os.path.join(LLAMA_DIR, "build", "bin", "llama-tts.exe")
 M = os.path.join(ROOT, "models", "Qwen3-TTS-0.6B-q8_0.gguf")
 MM = os.path.join(ROOT, "models", "mmproj-Qwen3-TTS-0.6B-q8_0.gguf")
 SRC = os.path.join(ROOT, "ctest", "voice_ab", "voicedesign")

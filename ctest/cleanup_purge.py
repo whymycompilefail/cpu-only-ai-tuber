@@ -27,15 +27,16 @@ TARGETS = [
     "Qwen3-TTS-12Hz-1.7B-VoiceDesign/.git",
     "Qwen3-TTS-12Hz-0.6B-Base/.git",
     "MiniCPM5-1B/.git",
-    "Qwen3.5-0.8B/.git",
-    "Qwen3-0.6B/.git",
     "glm-edge-4b-chat/.git",
     "bitnet-b1.58-2B-4T-bf16/.git",
     "dist",
 ]
 
 # 硬保护：自有 fork 历史 / 栈在用的 venv / 缓存
-PROTECTED = ("llama.cpp/.git", ".venv")
+# .git.fork-backup 是 fork 历史的**当前**位置（57 MB，gitignore，仅本地一份）；
+# llama.cpp/.git 是改名前的旧路径，一并保留以防旧检出。原名单只写了旧路径，
+# 与磁盘实际不符，等于保护空转。
+PROTECTED = ("llama.cpp/.git.fork-backup", "llama.cpp/.git", ".venv")
 
 
 def _walk_files(base):

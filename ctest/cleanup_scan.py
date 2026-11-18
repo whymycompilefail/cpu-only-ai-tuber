@@ -11,8 +11,14 @@ Two things this script refuses to skip past:
    So every file under a directory whose .git we plan to drop gets its head
    bytes read first.
 
-2. llama.cpp/.git is our own fork. Deleting it would destroy the only history
-   the eventual open-source release needs. It is never a candidate.
+2. llama.cpp/.git.fork-backup is our own fork. Deleting it would destroy the
+   only history the eventual open-source release needs. It is never a candidate.
+
+   NOTE (2026-11-18): this directory used to be llama.cpp/.git. At some point
+   llama.cpp was flattened into the parent repo and the fork history was moved
+   aside to .git.fork-backup (57 MB, gitignored, LOCAL ONLY -- it is the single
+   copy). The old guard string no longer matched anything, so the protection was
+   silently vacuous. Keep this path in sync with reality.
 """
 
 import argparse
@@ -25,16 +31,17 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LFS_MAGIC = b"version https://git-lfs.github.com/spec/v1"
 
 # Never touch: our own fork's history.
-PROTECTED = {"llama.cpp/.git"}
+# .git.fork-backup is the CURRENT name; llama.cpp/.git is kept as a legacy alias
+# in case an old checkout still has it. This set is matched EXACTLY (see the
+# `rel in PROTECTED` check below), so both spellings must be listed.
+PROTECTED = {"llama.cpp/.git.fork-backup", "llama.cpp/.git"}
 
 GIT_DIRS = [
     "MiniCPM5-1B/.git",
     "MiniCPM5-2B-gguf/.git",
     "Nanbeige4.2-3B/.git",
-    "Qwen3-0.6B/.git",
     "Qwen3-TTS-12Hz-0.6B-Base/.git",
     "Qwen3-TTS-12Hz-1.7B-VoiceDesign/.git",
-    "Qwen3.5-0.8B/.git",
     "Qwen3.5-2B-GGUF/.git",
     "bitnet-b1.58-2B-4T-bf16/.git",
     "glm-edge-4b-chat/.git",

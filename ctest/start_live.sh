@@ -25,7 +25,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJ="$ROOT/Open-LLM-VTuber"
 LOGDIR="$ROOT/ctest"
 PY="$PROJ/.venv/Scripts/python.exe"
-LLAMA="$ROOT/llama.cpp/build/bin/llama-server.exe"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
+[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LLAMA="$LLAMA_DIR/build/bin/llama-server.exe"
 MODEL="${STACK_MODEL:-$ROOT/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q4_K_M.gguf}"
 BRIDGE_PORT="${BRIDGE_PORT:-8765}"
 # Browser cookies that clear code -352 on the token APIs. Default location is
@@ -85,7 +87,7 @@ taskkill //F //IM llama-tts.exe >/dev/null 2>&1
 sleep 2
 
 echo "=== 1. llama-server :8099 ==="
-cd "$ROOT/llama.cpp/build/bin" || exit 1
+cd "$LLAMA_DIR/build/bin" || exit 1
 "$LLAMA" -m "$MODEL" -c 4096 -t 12 --reasoning off \
     --dry-multiplier 0.8 --repeat-penalty 1.05 \
     --host 127.0.0.1 --port 8099 \

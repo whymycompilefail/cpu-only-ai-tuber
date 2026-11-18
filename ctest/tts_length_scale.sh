@@ -3,7 +3,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root, derived f
 # Qwen3-TTS length-scaling experiment:
 #   is the "vocoder" cost FIXED (amortisable) or PROPORTIONAL to audio length?
 # model is 12.5 Hz -> audio_s = frames / 12.5
-cd $ROOT/llama.cpp || exit 1
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
+[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+cd "$LLAMA_DIR" || exit 1
 TTS=build/bin/llama-tts.exe
 M=../models/Qwen3-TTS-0.6B-q8_0.gguf
 MM=../models/mmproj-Qwen3-TTS-0.6B-f16.gguf

@@ -8,7 +8,9 @@
 # usage: bash ctest/eval_model.sh <model.gguf> <label> [port]
 set -u
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA="$ROOT/llama.cpp/build/bin/llama-server.exe"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
+[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LLAMA="$LLAMA_DIR/build/bin/llama-server.exe"
 # Was a user-profile absolute path (C:/Users/<name>/.workbuddy/...) -- that leaks
 # the Windows account name, and no one cloning this repo has that path anyway.
 # Use the project venv instead: it travels with the repo and already has the

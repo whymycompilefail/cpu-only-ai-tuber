@@ -10,7 +10,9 @@
 #
 # usage: bash ctest/try_model.sh <gguf> [label] [port]
 set -u
-LLAMA="$ROOT/llama.cpp/build/bin/llama-server.exe"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
+[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LLAMA="$LLAMA_DIR/build/bin/llama-server.exe"
 MODEL="${1:?usage: try_model.sh <gguf> [label] [port]}"
 LABEL="${2:-$(basename "$MODEL")}"
 PORT="${3:-8096}"

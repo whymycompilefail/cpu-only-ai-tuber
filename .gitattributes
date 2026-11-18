@@ -1,0 +1,6 @@
+# .bat 逐字节保真。
+# cmd.exe 解析 LF 行尾的批处理会出错，尤其是带 `&::` 注释、`if (...)` 块和标签的；
+# 而 core.autocrlf=input 会在提交时把 CRLF 转成 LF。用 -text 让 git 完全不碰这些字节。
+# 不用 `eol=crlf`：那个只是 checkout 时补 CR，仓库里存的仍是 LF，
+# 于是"仓库里的版本"和"实际能跑的版本"不是同一份，diff 里看不出问题。
+*.bat -text

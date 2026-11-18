@@ -3,7 +3,10 @@
 # Two groups: no speaker reference (voice sampled from the model prior) and
 # spk_1 reference (does the reference override the seed?).
 set -u
-BIN=./llama.cpp/build/bin/llama-tts.exe
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root, derived from this file
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
+[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+BIN="$LLAMA_DIR/build/bin/llama-tts.exe"
 M=models/Qwen3-TTS-0.6B-f16.gguf
 MM=models/mmproj-Qwen3-TTS-0.6B-f16.gguf
 OUT=ctest/voice_ab/seedscan

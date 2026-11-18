@@ -20,9 +20,17 @@ if errorlevel 1 (echo MINIMAL_BUILD_FAILED & exit /b 1)
 echo MINIMAL_OK
 
 rem --- 2) llama.cpp configure + build ---
-if exist %ROOT%\llama.cpp\build rmdir /s /q %ROOT%\llama.cpp\build
-cmake -S %ROOT%\llama.cpp -B %ROOT%\llama.cpp\build -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_MT="%CMAKE_MT_PATH%" -DCMAKE_RC_COMPILER="%CMAKE_RC_PATH%"
+rem Source is NOT in this repo any more: it comes from cpu-afterburner (patch).
+rem   git clone https://github.com/whymycompilefail/cpu-afterburner
+rem   DEST=<path> bash cpu-afterburner/scripts/setup.sh
+rem Lookup: LLAMA_DIR > <repo>\..\llama-cpp > <repo>\llama.cpp (old layout)
+if not defined LLAMA_DIR set "LLAMA_DIR=%ROOT%\..\llama-cpp"
+if not exist "%LLAMA_DIR%\CMakeLists.txt" if exist "%ROOT%\llama.cpp\CMakeLists.txt" set "LLAMA_DIR=%ROOT%\llama.cpp"
+if not exist "%LLAMA_DIR%\CMakeLists.txt" (echo NO_LLAMA_SOURCE & echo   set LLAMA_DIR or run cpu-afterburner/scripts/setup.sh & exit /b 1)
+echo LLAMA_DIR=%LLAMA_DIR%
+if exist "%LLAMA_DIR%\build" rmdir /s /q "%LLAMA_DIR%\build"
+cmake -S "%LLAMA_DIR%" -B "%LLAMA_DIR%\build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF -DGGML_VULKAN=OFF -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF -DCMAKE_MT="%CMAKE_MT_PATH%" -DCMAKE_RC_COMPILER="%CMAKE_RC_PATH%"
 if errorlevel 1 (echo LLAMA_CONFIGURE_FAILED & exit /b 1)
-cmake --build %ROOT%\llama.cpp\build -j 8
+cmake --build "%LLAMA_DIR%\build" -j 8
 if errorlevel 1 (echo LLAMA_BUILD_FAILED & exit /b 1)
 echo LLAMA_BUILD_OK

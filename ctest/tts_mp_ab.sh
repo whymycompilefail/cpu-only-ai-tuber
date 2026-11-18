@@ -3,7 +3,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root, derived f
 # A/B: does the vocoder (which lives in mmproj) respond to threads and to quantisation?
 # backbone is fixed at q8_0; the 5-prompt loop gives steady-state numbers (iter 0 is warmup).
 set -u
-LL=$ROOT/llama.cpp/build/bin/llama-tts.exe
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
+[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LL=$LLAMA_DIR/build/bin/llama-tts.exe
 M=$ROOT/models
 IN=$ROOT/ctest/tts_loop_in.txt
 OUT=$ROOT/ctest
@@ -11,7 +13,7 @@ OUT=$ROOT/ctest
 run () {
     local tag=$1 mp=$2 t=$3
     echo "=== tag=$tag mmproj=$mp threads=$t ==="
-    cd $ROOT/llama.cpp
+    cd "$LLAMA_DIR"
     LLAMA_TTS_LOOP=1 "$LL" \
         -m "$M/Qwen3-TTS-0.6B-q8_0.gguf" \
         -mm "$M/$mp" \

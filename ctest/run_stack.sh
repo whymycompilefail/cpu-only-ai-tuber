@@ -9,7 +9,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repo root, derived f
 #        bash ctest/run_stack.sh --wait     # stay attached until Ctrl+C
 
 set -u
-LLAMA="$ROOT/llama.cpp/build/bin/llama-server.exe"
+LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
+[ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
+LLAMA="$LLAMA_DIR/build/bin/llama-server.exe"
 # Chat model. Qwen3.5-2B Q4_K_M replaced MiniCPM5-2B Q4_K_M on 2026-10-02:
 # same 0/15 persona-break rate under the real persona config, but replies are
 # less formulaic and emotion tags come back reliably instead of being dropped.
