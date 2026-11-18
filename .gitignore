@@ -170,7 +170,21 @@ ctest/scan.txt
 ctest/spec_ngramcache.txt
 ctest/spec_ab/
 
-# fork 的原 .git 被改名停放（见 patches/README.md）。改名而不是删除，
-# 是为了让 git 不再把 llama.cpp 当成嵌套仓库 —— 否则 `git add` 只记录一个
-# gitlink，clone 的人拿不到任何源码。历史一点没丢，改名回来即可恢复。
+# fork 的原 .git 曾改名停放在这里（改名的原因：目录里只要存在 .git，
+# 外层 git add 就只记一个 gitlink，clone 的人拿到空目录）。
+# 2026-11-18 起整个 llama.cpp/ 已移出本仓库，构建改由 cpu-afterburner 的
+# patch + 脚本产出，历史备份留在本地 D:\llama.cpp-fork-history.git。
+# 这条留着只是为了让老 checkout 不会因为残留目录被加进去。
 llama.cpp/.git.fork-backup/
+
+# ---------------------------------------------------------------------------
+# 2026-11-18：磁盘上存在、但刻意不跟踪的目录。
+# 两类：外部下载的权重（几十 G，绝不能进仓库），以及已经发布到别的仓库的
+# 开发树（path1/ repair_eval/ code_eval/ → cpu-intern）。
+# 这几条不加的话，一次 `git add -A` 会把 48 G 吸进提交。
+tmp/
+Qwen2.5-Coder-3B-Instruct-GGUF/
+third_party/
+path1/
+repair_eval/
+code_eval/

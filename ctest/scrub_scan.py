@@ -78,8 +78,8 @@ PATTERNS = [
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
              "llama.cpp", "bitnet-b1.58-2B-4T-bf16", "glm-edge-4b-chat",
              "MiniCPM5-1B", "MiniCPM5-2B-gguf", "Nanbeige4.2-3B",
-             "Qwen3-0.6B", "Qwen3-TTS-12Hz-0.6B-Base",
-             "Qwen3-TTS-12Hz-1.7B-VoiceDesign", "Qwen3.5-0.8B",
+             "Qwen3-TTS-12Hz-0.6B-Base",
+             "Qwen3-TTS-12Hz-1.7B-VoiceDesign",
              "Qwen3.5-2B-GGUF", "models", "舒芙蕾"}
 SKIP_EXTS = {".exe", ".dll", ".bin", ".gguf", ".safetensors", ".moc3",
              ".png", ".jpg", ".wav", ".pdf", ".zip", ".gz", ".pyd", ".lib"}
