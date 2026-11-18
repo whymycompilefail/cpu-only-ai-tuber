@@ -3,8 +3,9 @@
 **一台没有显卡的笔记本，真的把 AI 主播挂上了 B 站直播。**
 
 > A local AI VTuber stack that runs end-to-end on CPU only — bilibili chat / your
-> microphone → Qwen3.5-2B → Qwen3-TTS → Live2D — plus a CPU-tuned llama.cpp fork
-> and the measurements behind every decision, including the ones we rejected.
+> microphone → Qwen3.5-2B → Qwen3-TTS → Live2D — on a CPU-tuned llama.cpp build
+> from [cpu-afterburner](https://github.com/whymycompilefail/cpu-afterburner),
+> plus the measurements behind every decision, including the ones we rejected.
 
 参考机器：**Intel Core Ultra 7 155H，22 线程，无 GPU。**
 
@@ -12,7 +13,7 @@
 |---|---|
 | 聊天 LLM | `Qwen3.5-2B` Q4_K_M（2026-10-02 起，取代 MiniCPM5-2B） |
 | 语音合成 | `Qwen3-TTS-12Hz-0.6B-Base` 朗读 + `1.7B-VoiceDesign` 造参考音色 |
-| 推理引擎 | 本仓库的 llama.cpp fork（`llama-server`，OpenAI 兼容） |
+| 推理引擎 | [cpu-afterburner](https://github.com/whymycompilefail/cpu-afterburner) 构建的 CPU 特化 llama.cpp（`llama-server`，OpenAI 兼容） |
 | 前端表演 | Open-LLM-VTuber + Live2D（Cubism 模型自备，见 `ASSETS.md`） |
 | 输入 | B 站直播间弹幕，或你自己的麦克风 |
 
@@ -95,16 +96,26 @@ llama-server 启动即崩。
 
 | 目录 | 说明 |
 |---|---|
-| `llama.cpp/` | 我们的 CPU 特化 fork。相对上游 `5096f2a` 改了 **15 个文件 / +1121 −173 行**，详见 `patches/README.md` |
-| `patches/` | 上述魔改的完整 diff，可重放到干净的上游 checkout |
 | `Open-LLM-VTuber/` | 上游（MIT）**+ 我们的一处魔改**：ASR 延迟初始化，见 `specs/open-llm-vtuber-lazy-asr.md` |
 | `ctest/` | 自研工具：起停栈、弹幕桥接、破人设探针、声线批量生成、发布前隐私扫描 |
 | `specs/` | 每次改动**为什么这么做**，附实测数据。含被否决的方案 |
 | `ASSETS.md` | 模型权重 / 音色 / Live2D 形象去哪拿，以及各自的协议 |
 
-关于 `llama.cpp/` 有一点必须知道：它的 `.git` 被改名成了 `.git.fork-backup/`。
-**这不是删历史**——只要目录里存在 `.git`，外层 `git add` 就只会记一个 gitlink，clone 的人
-拿到空目录。改回来一条命令：`mv llama.cpp/.git.fork-backup llama.cpp/.git`。
+### llama.cpp 源码不在本仓
+
+CPU 特化构建（`llama-server` / `llama-bench` / `llama-tts`）来自
+[cpu-afterburner](https://github.com/whymycompilefail/cpu-afterburner)：相对上游 `5096f2a`
+的一份 patch（20 文件），不是搬进本仓的 vendor 代码。本仓原先那份 `llama.cpp/` 副本
+已移除——它和那个仓库是同一份改动的两份拷贝，留着只会分叉。
+
+脚本统一按下面的顺序找构建产物（`LLAMA_DIR`）：
+
+1. `$LLAMA_DIR`（显式指定）
+2. 本仓同级目录 `../llama-cpp`（默认；几个项目可以共用一份构建）
+3. 本仓内 `llama.cpp/`（旧布局，仅作回退）
+
+> 注意 `ALTERVOX_LLAMA_TTS` 之类的环境变量会被**优先**采纳，比 `LLAMA_DIR` 还靠前。
+> 换过路径却仍然跑到旧构建时，先查环境变量。
 
 ---
 
@@ -115,11 +126,15 @@ llama-server 启动即崩。
 > 换机器大概率要改，尤其是进程管理和路径那几处。它不是"clone 下来就能跑"的项目，
 > 更像一份带完整证据链的运行手册。
 
-1. **编译 fork**（需要 CMake + MSVC/GCC）
+1. **拉源码并编译**（需要 CMake + MSVC/GCC）
 
    ```bash
-   cd llama.cpp && cmake -B build && cmake --build build --config Release
+   git clone https://github.com/whymycompilefail/cpu-afterburner ../cpu-afterburner
+   DEST=../llama-cpp bash ../cpu-afterburner/scripts/setup.sh
    ```
+
+   装到本仓同级，上面的查找顺序就能直接命中。Windows 上必须在 MSVC 环境里跑
+   （`INCLUDE` / `LIB` 要有值），否则会挂在 `C1083: 无法打开 stdbool.h`。
 
 2. **创建 Python 环境**
 
@@ -200,8 +215,8 @@ llama-server 启动即崩。
 
 ## 许可
 
-- 本仓库自己写的部分（`ctest/` `specs/` `patches/` 及根目录文件）：**MIT**，见 `LICENSE`
-- `llama.cpp/`：MIT（上游 + 我们的修改）
+- 本仓库自己写的部分（`ctest/` `specs/` 及根目录文件）：**MIT**，见 `LICENSE`
+- `llama.cpp` 的修改（以 patch 形式放在 [cpu-afterburner](https://github.com/whymycompilefail/cpu-afterburner)）：MIT（上游 + 我们的修改）
 - `Open-LLM-VTuber/`：MIT（上游 + 我们的 ASR 延迟初始化）
 - 模型权重：**Apache-2.0**，见 `ASSETS.md`
 

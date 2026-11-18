@@ -181,19 +181,22 @@ echo "exit=$?"     # 必须是 0，五项全 clean
 
 - [ ] **给 dist 写一个主 README**：这是什么、为什么是这套结构、先看 ASSETS.md、
       先跑 G1 自检。**现在的包里陌生人 clone 下来不知道先看哪里。**
-- [x] ~~决定 llama.cpp fork 的魔改要不要单独开仓库~~ —— **2026-10-11 拍板：不开，并入本仓。**
-      理由：这项目最硬的东西就是那 15 个文件的 CPU 魔改，把它挪到另一个仓库，
-      首页就只剩"一堆调用别人二进制的脚本"。容量也完全装得下（+90.4 MB，总量
-      148.3 MB / 占 1 GB 软上限的 14.5%）。
+- [x] ~~决定 llama.cpp fork 的魔改要不要单独开仓库~~ ——
+      ~~2026-10-11 拍板：不开，并入本仓。~~ 🔴 **已推翻（2026-11-18）：改为独立仓库
+      [cpu-afterburner](https://github.com/whymycompilefail/cpu-afterburner)，
+      本仓内的 `llama.cpp/` 与 `patches/` 均已移除。**
 
-      实现上有两个坑已处理，细节见 `patches/README.md`：
+      当时的理由：这项目最硬的东西就是那 15 个文件的 CPU 魔改，挪到另一个仓库，首页
+      就只剩"一堆调用别人二进制的脚本"；容量也装得下（+90.4 MB，148.3 MB / 1 GB 的 14.5%）。
 
-      1. **`llama.cpp/.git` 必须改名**（现为 `llama.cpp/.git.fork-backup/`）。否则外层
-         `git add` 只记一个 gitlink（mode 160000），clone 的人拿到空目录，且该 commit
-         不在任何公共远端，submodule 也救不回来。改名回去即可恢复完整历史。
-      2. **魔改原本是未提交的工作区改动**（fork 只有 2 个 commit：上游快照 + flatten）。
-         已导出为 `patches/llama-cpp-cpu-tuning.patch`（15 文件 / +1121 −173），
-         这样即使脱离 fork 的 `.git`，"改了什么"仍然可读、可重放。
+      **那条理由只在"一个项目"里成立。** 后来三个项目（本仓、AlterVox、cpu-intern）
+      各自带一份 603 MB 副本、历史各自分叉，谁也不知道哪份最新；而且 TTS 改动本来就在
+      同一套 llama.cpp 里，把 TTS 当成主播栈私货拆出去，等于把"CPU 优化"这件事拆成两半。
+      现在源码只有一处（patch 20 文件 / +1428 −194），各项目按 `LLAMA_DIR` 找同一份构建。
+
+      历史决策里的两个坑仍然成立，留作记录：`.git` 不改名会被外层 `git add` 记成
+      gitlink（mode 160000），clone 的人拿到空目录；魔改原本是未提交的工作区改动。
+      fork 的完整 commit 历史现留在本地 `D:\llama.cpp-fork-history.git`，不随本仓发布。
 
 ### 运行数据的生命周期（删了会不会再长出来）
 
