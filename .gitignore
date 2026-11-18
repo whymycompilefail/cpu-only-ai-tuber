@@ -92,6 +92,8 @@ models/**/*.bin
 models/**/*.safetensors
 models/**/*.onnx
 models/**/*.npz
+# 源权重目录（fetch_bench_models.sh 下载的），tokenizer/config 一并忽略
+models/*-src/
 
 # ctest 运行时产物。同样的问题：ctest/*.wav 只匹配顶层，
 # ctest/voice_ab/ 下 255 个 wav + 7 个 mp3 全漏。
