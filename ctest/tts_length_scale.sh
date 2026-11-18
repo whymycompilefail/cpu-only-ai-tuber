@@ -7,8 +7,8 @@ LLAMA_DIR="${LLAMA_DIR:-$ROOT/../llama-cpp}"
 [ -d "$LLAMA_DIR/build/bin" ] || LLAMA_DIR="$ROOT/llama.cpp"   # 回落旧布局
 cd "$LLAMA_DIR" || exit 1
 TTS=build/bin/llama-tts.exe
-M=../models/Qwen3-TTS-0.6B-q8_0.gguf
-MM=../models/mmproj-Qwen3-TTS-0.6B-f16.gguf
+M="$ROOT/models/Qwen3-TTS-0.6B-q8_0.gguf"
+MM="$ROOT/models/mmproj-Qwen3-TTS-0.6B-f16.gguf"
 
 for th in 12 22; do
   for L in short med long; do
